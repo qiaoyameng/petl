@@ -2,12 +2,12 @@ from __future__ import absolute_import, print_function, division
 
 
 from operator import itemgetter, attrgetter
+
 from petl.compat import text_type
-
-
+from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import asindices, records, Table, values, rowgroupby
-from petl.errors import DuplicateKeyError
-from petl.transform.basics import addfield
+from petl.errors import ArgumentError, DuplicateKeyError
+from petl.transform.basics import addfield, cutout, stack
 from petl.transform.sorts import sort
 
 
@@ -313,7 +313,331 @@ def intervalrecordlookupone(table, start='start', stop='stop',
     return IntervalTreeLookupOne(tree, include_stop=include_stop, strict=strict)
 
 
+
 Table.intervalrecordlookupone = intervalrecordlookupone
+
+
+_VALIDITY_ORDER_FIELD = '__petl_validityjoin_order__'
+_VALIDITY_RULE_ORDER_FIELD = '__petl_validityjoin_rule_order__'
+_VALIDITY_INVALID_POLICIES = ('raise', 'ignore')
+
+
+def validityjoin(left, right, time='time', key=None, lkey=None, rkey=None,
+                 rstart='start', rend='end', missing=None, presorted=False,
+                 buffersize=None, tempdir=None, cache=True,
+                 invalid_time='raise', invalid_interval='raise',
+                 lprefix=None, rprefix=None):
+    """
+    Join point-in-time events to rules whose validity intervals contain them.
+    E.g.::
+
+        >>> import petl as etl
+        >>> events = [['customer', 'event_time', 'name'],
+        ...           ['b', 1, 'no-rule'],
+        ...           ['a', 2, 'nested'],
+        ...           ['a', 4, 'boundary'],
+        ...           ['a', 5, 'open']]
+        >>> rules = [['customer', 'rule', 'start', 'end'],
+        ...          ['a', 'v1', 1, 4],
+        ...          ['a', 'v2', 2, 3],
+        ...          ['a', 'current', 4, None]]
+        >>> etl.validityjoin(events, rules, key='customer',
+        ...                  time='event_time').lookall()
+        +----------+------------+------------+-----------+-------+------+
+        | customer | event_time | name       | rule      | start | end  |
+        +==========+============+============+===========+=======+======+
+        | 'b'      |          1 | 'no-rule'  | None      | None  | None |
+        +----------+------------+------------+-----------+-------+------+
+        | 'a'      |          2 | 'nested'   | 'v1'      |     1 |    4 |
+        +----------+------------+------------+-----------+-------+------+
+        | 'a'      |          2 | 'nested'   | 'v2'      |     2 |    3 |
+        +----------+------------+------------+-----------+-------+------+
+        | 'a'      |          4 | 'boundary' | 'current' |     4 | None |
+        +----------+------------+------------+-----------+-------+------+
+        | 'a'      |          5 | 'open'     | 'current' |     4 | None |
+        +----------+------------+------------+-----------+-------+------+
+        <BLANKLINE>
+
+
+    Rule intervals are half-open: ``start <= event time < end``. A rule with
+    a missing `end` value remains valid indefinitely. All overlapping rules
+    for the same business key are returned, while events with no matching rule
+    are retained with missing values in the right-hand fields.
+
+    The compound business key may be specified once with `key`, or separately
+    for each table with `lkey` and `rkey`. By default, output rows preserve
+    the original order of `left`; multiple rules for one event preserve the
+    order in `right`.
+
+    If `presorted` is True, `left` is assumed to be sorted by its business key
+    followed by `time`, and `right` is assumed to be sorted by its business
+    key followed by `rstart`. The join then scans both tables once rather
+    than searching the rule table for each event.
+
+    Set `invalid_interval` to ``'ignore'`` to skip rules with missing starts
+    or reversed intervals. Set `invalid_time` to ``'ignore'`` to retain events
+    with missing times as unmatched rows. The default ``'raise'`` rejects
+    these rows with an `ArgumentError`.
+
+    Right-hand key fields are not duplicated in the output, matching the
+    behaviour of equi-joins. Use `lprefix` and `rprefix` to make other
+    conflicting field names unambiguous.
+
+    """
+
+    if invalid_time not in _VALIDITY_INVALID_POLICIES:
+        raise ArgumentError(
+            "invalid_time must be one of 'raise' or 'ignore'")
+    if invalid_interval not in _VALIDITY_INVALID_POLICIES:
+        raise ArgumentError(
+            "invalid_interval must be one of 'raise' or 'ignore'")
+    if key is None:
+        if lkey is None or rkey is None:
+            raise ArgumentError(
+                'either key or both lkey and rkey must be provided')
+    else:
+        if lkey is not None or rkey is not None:
+            raise ArgumentError(
+                'specify either key or both lkey and rkey, but not both')
+        lkey = rkey = key
+
+    return ValidityJoinView(
+        left, right, time=time, lkey=lkey, rkey=rkey, rstart=rstart,
+        rend=rend, missing=missing, presorted=presorted,
+        buffersize=buffersize, tempdir=tempdir, cache=cache,
+        invalid_time=invalid_time, invalid_interval=invalid_interval,
+        lprefix=lprefix, rprefix=rprefix)
+
+
+Table.validityjoin = validityjoin
+
+
+class _OrderedRows(Table):
+
+    def __init__(self, source, field):
+        self.source = stack(source)
+        self.field = field
+
+    def __iter__(self):
+        it = iter(self.source)
+        hdr = next(it)
+        yield tuple(hdr) + (self.field,)
+        for order, row in enumerate(it):
+            yield tuple(row) + (order,)
+
+
+class ValidityJoinView(Table):
+
+    def __init__(self, left, right, time, lkey, rkey, rstart, rend, missing,
+                 presorted, buffersize, tempdir, cache, invalid_time,
+                 invalid_interval, lprefix, rprefix):
+        self.time = time
+        self.lkey = lkey
+        self.rkey = rkey
+        self.rstart = rstart
+        self.rend = rend
+        self.missing = missing
+        self.presorted = presorted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.sort_cache = cache
+        self.invalid_time = invalid_time
+        self.invalid_interval = invalid_interval
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+
+        left = stack(left, missing=missing)
+        right = stack(right, missing=missing)
+        if presorted:
+            self.left = left
+            self.right = right
+        else:
+            lsortkey = _validity_field_tuple(lkey) + (time,)
+            rsortkey = _validity_field_tuple(rkey) + (rstart,)
+            ordered_left = _OrderedRows(left, _VALIDITY_ORDER_FIELD)
+            ordered_right = _OrderedRows(right, _VALIDITY_RULE_ORDER_FIELD)
+            self.left = sort(ordered_left, lsortkey,
+                             buffersize=buffersize, tempdir=tempdir,
+                             cache=cache)
+            self.right = sort(ordered_right, rsortkey,
+                              buffersize=buffersize, tempdir=tempdir,
+                              cache=cache)
+
+    def __iter__(self):
+        rows = itervalidityjoin(
+            self.left, self.right, time=self.time, lkey=self.lkey,
+            rkey=self.rkey, rstart=self.rstart, rend=self.rend,
+            missing=self.missing, invalid_time=self.invalid_time,
+            invalid_interval=self.invalid_interval, lprefix=self.lprefix,
+            rprefix=self.rprefix,
+            rorder=None if self.presorted else _VALIDITY_RULE_ORDER_FIELD)
+        if self.presorted:
+            return rows
+        rows = sort(rows, _VALIDITY_ORDER_FIELD, buffersize=self.buffersize,
+                    tempdir=self.tempdir, cache=self.sort_cache)
+        return iter(cutout(rows, _VALIDITY_ORDER_FIELD))
+
+
+def _validity_field_tuple(key):
+    if isinstance(key, (list, tuple)):
+        return tuple(key)
+    return (key,)
+
+
+def _validity_output_header(lhdr, rhdr, rkind, lprefix, rprefix,
+                            rorder=None):
+    excluded = set(rkind)
+    if rorder is not None:
+        excluded.update(asindices(rhdr, rorder))
+    rvind = [i for i in range(len(rhdr)) if i not in excluded]
+    if lprefix is None:
+        outhdr = list(lhdr)
+    else:
+        outhdr = [f if f == _VALIDITY_ORDER_FIELD
+                  else text_type(lprefix) + text_type(f) for f in lhdr]
+    if rprefix is None:
+        outhdr.extend(rhdr[i] for i in rvind)
+    else:
+        outhdr.extend(text_type(rprefix) + text_type(rhdr[i]) for i in rvind)
+    return tuple(outhdr), rvind
+
+
+def _validity_emit(lrow, rrow, rvind, missing):
+    outrow = list(lrow)
+    if rrow is None:
+        outrow.extend(missing for _ in rvind)
+    else:
+        outrow.extend(rrow[i] if i < len(rrow) else None for i in rvind)
+    return tuple(outrow)
+
+
+def _ensure_valid_rule(rule_start, rule_end, row_number, policy):
+    if rule_start is None:
+        if policy == 'raise':
+            raise ArgumentError(
+                'rule row %d has missing start value' % row_number)
+        return False
+    if rule_end is not None and Comparable(rule_end) < Comparable(rule_start):
+        if policy == 'raise':
+            raise ArgumentError(
+                'rule row %d has end before start: end %r must not be '
+                'before start %r' % (row_number, rule_end, rule_start))
+        return False
+    return True
+
+
+def itervalidityjoin(left, right, time, lkey, rkey, rstart, rend, missing,
+                     invalid_time, invalid_interval, lprefix, rprefix,
+                     rorder=None):
+    lit = iter(left)
+    rit = iter(right)
+    lhdr = next(lit)
+    rhdr = next(rit)
+
+    lkind = tuple(asindices(lhdr, lkey))
+    rkind = tuple(asindices(rhdr, rkey))
+    ltimeind = asindices(lhdr, time)
+    rstartind = asindices(rhdr, rstart)
+    rendind = asindices(rhdr, rend)
+
+    outhdr, rvind = _validity_output_header(
+        lhdr, rhdr, rkind, lprefix, rprefix, rorder=rorder)
+    yield outhdr
+
+    get_lkey = comparable_itemgetter(*lkind)
+    get_rkey = comparable_itemgetter(*rkind)
+    get_ltime = comparable_itemgetter(*ltimeind)
+    get_rstart = comparable_itemgetter(*rstartind)
+    get_rend = comparable_itemgetter(*rendind)
+    get_rorder = None if rorder is None else itemgetter(
+        *asindices(rhdr, rorder))
+
+    def emit(lrow, entry):
+        rrow = None if entry is None else entry[0]
+        return _validity_emit(lrow, rrow, rvind, missing)
+
+    state = {
+        'event_number': 0,
+        'rule_number': 0,
+        'pending_rule': None,
+        'pending_key': Comparable(None),
+        'active_key': Comparable(None),
+        'active_entries': [],
+        'rules_exhausted': False,
+    }
+
+    def advance_rule():
+        while not state['rules_exhausted']:
+            try:
+                candidate = next(rit)
+            except StopIteration:
+                state['rules_exhausted'] = True
+                state['pending_rule'] = None
+                return
+            state['rule_number'] += 1
+            candidate_start = get_rstart(candidate).inner
+            candidate_end = get_rend(candidate).inner
+            reported_number = state['rule_number']
+            if get_rorder is not None:
+                reported_number = get_rorder(candidate) + 1
+            if _ensure_valid_rule(candidate_start, candidate_end,
+                                  reported_number, invalid_interval):
+                order = None if get_rorder is None else get_rorder(candidate)
+                state['pending_rule'] = (candidate, order)
+                state['pending_key'] = get_rkey(candidate)
+                return
+
+    for lrow in lit:
+        state['event_number'] += 1
+        event_time_value = get_ltime(lrow).inner
+        if event_time_value is None:
+            if invalid_time == 'raise':
+                raise ArgumentError(
+                    'event row %d has missing time value'
+                    % state['event_number'])
+            yield emit(lrow, None)
+            continue
+
+        event_key = get_lkey(lrow)
+        event_time = Comparable(event_time_value)
+
+        if state['active_key'] != event_key:
+            state['active_key'] = event_key
+            state['active_entries'] = []
+
+        while not state['rules_exhausted']:
+            if state['pending_rule'] is None:
+                advance_rule()
+                continue
+            if state['pending_key'] >= event_key:
+                break
+            advance_rule()
+
+        if not state['rules_exhausted'] and state['pending_rule'] is not None \
+                and state['pending_key'] == event_key:
+            while state['pending_rule'] is not None and \
+                    state['pending_key'] == event_key and \
+                    get_rstart(state['pending_rule'][0]) <= event_time:
+                state['active_entries'].append(state['pending_rule'])
+                advance_rule()
+
+        surviving_entries = []
+        for entry in state['active_entries']:
+            rrow = entry[0]
+            rule_end = get_rend(rrow)
+            if rule_end.inner is None or event_time < rule_end:
+                surviving_entries.append(entry)
+        state['active_entries'] = surviving_entries
+
+        matched_entries = surviving_entries
+        if get_rorder is not None:
+            matched_entries = sorted(matched_entries,
+                                     key=lambda entry: entry[1])
+        if matched_entries:
+            for entry in matched_entries:
+                yield emit(lrow, entry)
+        else:
+            yield emit(lrow, None)
 
 
 def facetintervallookup(table, key, start='start', stop='stop',

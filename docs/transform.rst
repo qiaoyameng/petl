@@ -251,15 +251,15 @@ Validation
 .. module:: petl.transform.intervals
 .. _transform_intervals:
 
-Intervals (intervaltree)
-------------------------
+Intervals
+---------
 
-.. note::
+.. autofunction:: petl.transform.intervals.validityjoin
 
-    The following functions require the package `intervaltree
-    <https://github.com/chaimleib/intervaltree>`_ to be installed, e.g.::
+The functions below require the package `intervaltree
+<https://github.com/chaimleib/intervaltree>`_ to be installed, e.g.::
 
-        $ pip install intervaltree
+    $ pip install intervaltree
 
 .. autofunction:: petl.transform.intervals.intervaljoin
 .. autofunction:: petl.transform.intervals.intervalleftjoin
