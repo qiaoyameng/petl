@@ -251,6 +251,12 @@ Validation
 .. module:: petl.transform.intervals
 .. _transform_intervals:
 
+Validity joins
+--------------
+
+.. autofunction:: petl.transform.intervals.validityjoin
+
+
 Intervals (intervaltree)
 ------------------------
 

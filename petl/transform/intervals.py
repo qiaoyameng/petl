@@ -1,14 +1,432 @@
 from __future__ import absolute_import, print_function, division
 
 
+from collections import namedtuple
 from operator import itemgetter, attrgetter
+
+from petl.comparison import Comparable
 from petl.compat import text_type
 
 
 from petl.util.base import asindices, records, Table, values, rowgroupby
-from petl.errors import DuplicateKeyError
+from petl.errors import ArgumentError, DuplicateKeyError
 from petl.transform.basics import addfield
 from petl.transform.sorts import sort
+
+
+def validityjoin(left, right, key=None, lkey=None, rkey=None, time='time',
+                 start='start', end='end', presorted=False, missing=None,
+                 buffersize=None, tempdir=None, cache=True,
+                 missing_time='raise', invalid_interval='raise',
+                 lprefix=None, rprefix=None):
+    """
+    Join point-in-time event rows to rules effective at the event time.
+
+    Rule intervals are half-open: ``start <= time < end``. A missing rule
+    end means the rule is still effective. Every overlapping rule is
+    returned, while event rows without a match are retained with missing
+    values in the rule fields.
+
+        >>> import petl as etl
+        >>> events = [['id', 'time'], ['a', 2], ['a', 4]]
+        >>> rules = [['id', 'start', 'end', 'version'],
+        ...          ['a', 0, 4, 'old'],
+        ...          ['a', 2, 3, 'nested'],
+        ...          ['a', 4, None, 'new']]
+        >>> table = etl.validityjoin(events, rules, key='id')
+        >>> table.lookall()
+        +-----+------+-----+-------+------+----------+
+        | id  | time | id  | start | end  | version  |
+        +=====+======+=====+=======+======+==========+
+        | 'a' |    2 | 'a' |     0 |    4 | 'old'    |
+        +-----+------+-----+-------+------+----------+
+        | 'a' |    2 | 'a' |     2 |    3 | 'nested' |
+        +-----+------+-----+-------+------+----------+
+        | 'a' |    4 | 'a' |     4 | None | 'new'    |
+        +-----+------+-----+-------+------+----------+
+        <BLANKLINE>
+
+    If `presorted` is True, the event table must be ordered by business key
+    and event time, and the rule table by business key and start. That path
+    performs one ordered sweep and never scans all rules for one event.
+
+    Repeated event and rule field names are retained in the output, matching
+    the behaviour of other joins. Use `lprefix` and `rprefix` when duplicate
+    field names need to be predictable. Set `missing_time` or
+    `invalid_interval` to ``"skip"`` to omit invalid rows instead of raising.
+
+    """
+
+    if key is not None and (lkey is not None or rkey is not None):
+        raise ArgumentError(
+            'bad key arguments: either specify key, or specify both lkey '
+            'and rkey'
+        )
+    if (lkey is None) != (rkey is None):
+        raise ArgumentError('lkey and rkey must both be specified')
+    if key is not None:
+        lkey = rkey = key
+    lkey = _normalise_key(lkey)
+    rkey = _normalise_key(rkey)
+    if missing_time not in ('raise', 'skip'):
+        raise ArgumentError('missing_time must be either "raise" or "skip"')
+    if invalid_interval not in ('raise', 'skip'):
+        raise ArgumentError(
+            'invalid_interval must be either "raise" or "skip"'
+        )
+
+    return ValidityJoinView(
+        left, right, lkey=lkey, rkey=rkey, time=time, start=start, end=end,
+        presorted=presorted, missing=missing, buffersize=buffersize,
+        tempdir=tempdir, sort_cache=cache, missing_time=missing_time,
+        invalid_interval=invalid_interval, lprefix=lprefix, rprefix=rprefix
+    )
+
+
+Table.validityjoin = validityjoin
+
+
+def _normalise_key(key):
+    if key is None or isinstance(key, (list, tuple)):
+        return key
+    return (key,)
+
+
+def _unique_field(fields, candidate):
+    field = candidate
+    counter = 1
+    while field in fields:
+        counter += 1
+        field = candidate + str(counter)
+    return field
+
+
+def _row_value(row, index):
+    return row[index] if index < len(row) else None
+
+
+class _OrderedRows(Table):
+
+    def __init__(self, table, field):
+        self.table = table
+        self.field = field
+
+    def __iter__(self):
+        it = iter(self.table)
+        hdr = next(it)
+        yield tuple(list(hdr) + [self.field])
+        for order, row in enumerate(it):
+            yield tuple(list(row) + [order])
+
+
+class _CheckedEvents(Table):
+
+    def __init__(self, table, time, policy, missing=None):
+        self.table = table
+        self.time = time
+        self.policy = policy
+        self.missing = missing
+
+    def __iter__(self):
+        it = iter(self.table)
+        hdr = next(it)
+        width = len(hdr)
+        fields = list(map(text_type, hdr))
+        time_idx = fields.index(self.time)
+        padded_rows = (
+            tuple(list(row[:width]) +
+                  [self.missing] * max(0, width - len(row)))
+            for row in it
+        )
+        yield tuple(hdr)
+        for row_number, row in enumerate(padded_rows, start=1):
+            if _row_value(row, time_idx) is None:
+                if self.policy == 'raise':
+                    raise ValueError(
+                        'missing event time at row %d' % row_number
+                    )
+                continue
+            yield row
+
+
+class _CheckedRules(Table):
+
+    def __init__(self, table, start, end, policy, missing=None):
+        self.table = table
+        self.start = start
+        self.end = end
+        self.policy = policy
+        self.missing = missing
+
+    def __iter__(self):
+        it = iter(self.table)
+        hdr = next(it)
+        width = len(hdr)
+        yield tuple(hdr)
+        fields = list(map(text_type, hdr))
+        start_idx = fields.index(self.start)
+        end_idx = fields.index(self.end)
+        padded_rows = (
+            tuple(list(row[:width]) +
+                  [self.missing] * max(0, width - len(row)))
+            for row in it
+        )
+        for row_number, row in enumerate(padded_rows, start=1):
+            rule_start = _row_value(row, start_idx)
+            rule_end = _row_value(row, end_idx)
+            if rule_start is None:
+                if self.policy == 'raise':
+                    raise ValueError(
+                        'missing rule start at row %d' % row_number
+                    )
+                continue
+            if rule_end is not None:
+                try:
+                    if rule_start > rule_end:
+                        if self.policy == 'raise':
+                            raise ValueError(
+                                'invalid rule interval at row %d: start is '
+                                'after end' % row_number
+                            )
+                        continue
+                except TypeError:
+                    if self.policy == 'raise':
+                        raise ValueError(
+                            'incompatible rule interval coordinates at '
+                            'row %d' % row_number
+                        )
+                    continue
+            yield row
+
+
+class ValidityJoinView(Table):
+
+    def __init__(self, left, right, lkey, rkey, time, start, end,
+                 presorted=False, missing=None, buffersize=None,
+                 tempdir=None, sort_cache=True, missing_time='raise',
+                 invalid_interval='raise', lprefix=None, rprefix=None):
+        self.left = left
+        self.right = right
+        self.lkey = lkey
+        self.rkey = rkey
+        self.time = time
+        self.start = start
+        self.end = end
+        self.presorted = presorted
+        self.missing = missing
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.sort_cache = sort_cache
+        self.missing_time = missing_time
+        self.invalid_interval = invalid_interval
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+
+    def __iter__(self):
+        left = self.left
+        right = self.right
+        left_order = right_order = None
+
+        if not self.presorted:
+            lhdr = next(iter(left))
+            rhdr = next(iter(right))
+            left_order = _unique_field(list(map(text_type, lhdr)),
+                                       '__petl_event_order__')
+            right_order = _unique_field(list(map(text_type, rhdr)),
+                                        '__petl_rule_order__')
+            left = _OrderedRows(left, left_order)
+            right = _OrderedRows(right, right_order)
+
+        events = _CheckedEvents(left, self.time, self.missing_time,
+                                missing=self.missing)
+        rules = _CheckedRules(right, self.start, self.end,
+                              self.invalid_interval, missing=self.missing)
+
+        if not self.presorted:
+            left = sort(events, list(self.lkey or ()) + [self.time],
+                        buffersize=self.buffersize, tempdir=self.tempdir,
+                        cache=self.sort_cache)
+            right = sort(rules, list(self.rkey or ()) + [self.start],
+                         buffersize=self.buffersize, tempdir=self.tempdir,
+                         cache=self.sort_cache)
+
+        joined = itervalidityjoin(
+            events if self.presorted else left,
+            rules if self.presorted else right,
+            lkey=self.lkey, rkey=self.rkey, time=self.time, start=self.start,
+            end=self.end, missing=self.missing, lprefix=self.lprefix,
+            rprefix=self.rprefix, invalid_interval=self.invalid_interval,
+            left_order=left_order,
+            right_order=right_order
+        )
+        if self.presorted:
+            return joined
+        return iter(_restore_validity_order(joined, left_order))
+
+
+def _restore_validity_order(table, order_field):
+    ordered = sort(table, order_field)
+    it = iter(ordered)
+    hdr = next(it)
+    fields = list(map(text_type, hdr))
+    order_index = fields.index(order_field)
+    indices = [i for i in range(len(fields)) if i != order_index]
+    if len(indices) == 1:
+        def get_row(row):
+            return (row[indices[0]],)
+    else:
+        get_row = itemgetter(*indices)
+    yield get_row(hdr)
+    for row in it:
+        yield get_row(row)
+
+
+_ActiveRule = namedtuple('_ActiveRule', ['end', 'order', 'row'])
+
+
+def itervalidityjoin(left, right, lkey, rkey, time, start, end, missing,
+                     lprefix, rprefix, invalid_interval, left_order,
+                     right_order):
+    events = iter(left)
+    rules = iter(right)
+    lhdr = next(events)
+    rhdr = next(rules)
+    lflds = list(map(text_type, lhdr))
+    rflds = list(map(text_type, rhdr))
+
+    asindices(lhdr, time)
+    asindices(rhdr, start)
+    asindices(rhdr, end)
+    if lkey is not None:
+        asindices(lhdr, lkey)
+        asindices(rhdr, rkey)
+
+    def prefix_header(fields, prefix, order):
+        values = [field for field in fields if field != order]
+        if prefix is None:
+            return values
+        return [text_type(prefix) + text_type(field) for field in values]
+
+    out_lhdr = prefix_header(lflds, lprefix, left_order)
+    if left_order is not None:
+        out_lhdr.append(left_order)
+    yield tuple(out_lhdr + prefix_header(rflds, rprefix, right_order))
+
+    time_idx = lflds.index(time)
+    start_idx = rflds.index(start)
+    end_idx = rflds.index(end)
+    lorder_idx = lflds.index(left_order) if left_order is not None else None
+    rorder_idx = rflds.index(right_order) if right_order is not None else None
+    lkey_idx = asindices(lhdr, lkey) if lkey is not None else []
+    rkey_idx = asindices(rhdr, rkey) if rkey is not None else []
+    if lkey_idx:
+        get_event_key = itemgetter(*lkey_idx)
+    else:
+        def get_event_key(row):
+            return None
+    if rkey_idx:
+        get_rule_key = itemgetter(*rkey_idx)
+    else:
+        def get_rule_key(row):
+            return None
+    right_missing = [missing] * (
+        len(rflds) - (1 if right_order is not None else 0)
+    )
+
+    def remove_order(row, fields, order):
+        if order is None:
+            return tuple(row)
+        index = fields.index(order)
+        return tuple(row[:index] + row[index + 1:])
+
+    rule = None
+    rule_key = None
+    active = []
+    active_key = object()
+
+    def next_rule():
+        row = next(rules)
+        return row, get_rule_key(row)
+
+    for event in events:
+        event_time = _row_value(event, time_idx)
+        if event_time is None:
+            continue
+        event_key = get_event_key(event)
+        if event_key != active_key:
+            active_key = event_key
+            active = []
+
+        if rule is None:
+            try:
+                rule, rule_key = next_rule()
+            except StopIteration:
+                rule = None
+                rule_key = None
+
+        while rule is not None and \
+                Comparable(rule_key) < Comparable(event_key):
+            try:
+                rule, rule_key = next_rule()
+            except StopIteration:
+                rule = None
+                rule_key = None
+
+        while rule is not None and rule_key == event_key:
+            try:
+                starts_before_event = \
+                    _row_value(rule, start_idx) <= event_time
+            except TypeError:
+                if invalid_interval == 'raise':
+                    raise ValueError(
+                        'incompatible event and rule start coordinates'
+                    )
+                try:
+                    rule, rule_key = next_rule()
+                except StopIteration:
+                    rule = None
+                    rule_key = None
+                continue
+            if not starts_before_event:
+                break
+            rule_order = _row_value(rule, rorder_idx) \
+                if rorder_idx is not None else len(active)
+            active.append(_ActiveRule(_row_value(rule, end_idx),
+                                      rule_order, rule))
+            try:
+                rule, rule_key = next_rule()
+            except StopIteration:
+                rule = None
+                rule_key = None
+
+        still_active = []
+        for candidate in active:
+            if candidate.end is None:
+                still_active.append(candidate)
+                continue
+            try:
+                is_active = event_time < candidate.end
+            except TypeError:
+                if invalid_interval == 'raise':
+                    raise ValueError(
+                        'incompatible rule interval coordinate for event'
+                    )
+                continue
+            if is_active:
+                still_active.append(candidate)
+        active = still_active
+        event_out = tuple(event)
+        if not active:
+            yield tuple(list(event_out) + right_missing)
+            continue
+        if rorder_idx is not None:
+            matching = sorted(active, key=lambda candidate: candidate.order)
+        else:
+            matching = active
+        for candidate in matching:
+            yield tuple(list(event_out) +
+                        list(remove_order(candidate.row, rflds,
+                                          right_order)))
 
 
 def tupletree(table, start='start', stop='stop', value=None):
@@ -972,7 +1390,6 @@ def iterintervalsubtract(left, right, lstart, lstop, rstart, rstop, lkey, rkey,
                     yield tuple(out)
 
 
-from collections import namedtuple
 _Interval = namedtuple('Interval', 'start stop')
 
 
