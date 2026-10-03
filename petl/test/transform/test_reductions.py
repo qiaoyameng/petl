@@ -5,10 +5,14 @@ import operator
 
 
 from collections import OrderedDict
+import pytest
+
+from petl.errors import AggregationError
 from petl.test.helpers import ieq
 from petl.util import strjoin
 from petl.transform.reductions import rowreduce, aggregate, \
-    mergeduplicates, Conflict, fold
+    mergeduplicates, Conflict, fold, aggregateaccumulate
+from petl.util.base import Table
 
 
 def test_rowreduce():
@@ -494,3 +498,207 @@ def test_fold():
     expect = (('key', 'value'), (1, 8), (2, 12))
     ieq(expect, t2)
     ieq(expect, t2)
+
+
+def _accumulators(events=None, fail_init=False, fail_update=False,
+                  fail_finalize=False):
+    def init_count():
+        if events is not None:
+            events.append(('init', 'count'))
+        return [0]
+
+    def update_count(state, row):
+        if events is not None:
+            events.append(('update', 'count', row['foo']))
+        if fail_update and row['foo'] == 'b' and state[0] == 1:
+            raise ValueError('update failed')
+        state[0] += 1
+
+    def finalize_count(state):
+        if fail_finalize and state[0] == 2:
+            raise ValueError('finalize failed')
+        return state[0]
+
+    def init_mean():
+        if events is not None:
+            events.append(('init', 'mean'))
+        return [0, 0]
+
+    def update_mean(state, value):
+        if events is not None:
+            events.append(('update', 'mean', value))
+        state[0] += value
+        state[1] += 1
+
+    def finalize_mean(state):
+        return state[0] / state[1]
+
+    def init_order():
+        if events is not None:
+            events.append(('init', 'order'))
+        return []
+
+    def update_order(state, row):
+        if events is not None:
+            events.append(('update', 'order', row['baz']))
+        state.append(row['baz'])
+
+    def finalize_order(state):
+        return '->'.join(state)
+
+    init_calls = [0]
+
+    def maybe_failing_init_count():
+        init_calls[0] += 1
+        if fail_init and init_calls[0] == 2:
+            raise ValueError('init failed')
+        return init_count()
+
+    return OrderedDict((
+        ('count', (maybe_failing_init_count, update_count,
+                   finalize_count)),
+        ('mean', ('bar', init_mean, update_mean, finalize_mean)),
+        ('order', (init_order, update_order, finalize_order)),
+    ))
+
+
+class TrackingTable(Table):
+
+    def __init__(self, rows, events):
+        self.rows = rows
+        self.events = events
+
+    def __iter__(self):
+        hdr = self.rows[0]
+        self.events.append(('header',))
+        yield hdr
+        for row in self.rows[1:]:
+            self.events.append(('row', row[0], row[2]))
+            yield row
+
+
+def test_aggregateaccumulate():
+    table = (('foo', 'bar', 'baz'),
+             ('a', 1, 'x'),
+             ('a', 2, 'y'),
+             ('b', 3, 'y'),
+             ('b', 4, 'x'))
+
+    actual = aggregateaccumulate(table, 'foo', _accumulators())
+    expect = (('foo', 'count', 'mean', 'order'),
+              ('a', 2, 1.5, 'x->y'),
+              ('b', 2, 3.5, 'y->x'))
+    ieq(expect, actual)
+    ieq(expect, actual)
+
+
+def test_aggregateaccumulate_empty_and_header_only():
+    ieq((), aggregateaccumulate((), 'foo', _accumulators()))
+
+    table = (('foo', 'bar', 'baz'),)
+    expect = (('foo', 'count', 'mean', 'order'),)
+    ieq(expect, aggregateaccumulate(table, 'foo', _accumulators()))
+
+
+def test_aggregateaccumulate_state_isolation():
+    events = []
+    table = (('foo', 'bar', 'baz'),
+             ('a', 1, 'x'),
+             ('b', 2, 'y'),
+             ('b', 3, 'z'),
+             ('c', 4, 'z'))
+
+    actual = aggregateaccumulate(table, 'foo', _accumulators(events))
+    expect = (('foo', 'count', 'mean', 'order'),
+              ('a', 1, 1.0, 'x'),
+              ('b', 2, 2.5, 'y->z'),
+              ('c', 1, 4.0, 'z'))
+    ieq(expect, actual)
+    assert events.count(('init', 'count')) == 3
+    assert events.count(('init', 'mean')) == 3
+    assert events.count(('init', 'order')) == 3
+
+
+def test_aggregateaccumulate_compound_key_and_field_tuple():
+    table = (('foo', 'qux', 'bar', 'baz'),
+             ('a', 'p', 1, 10),
+             ('a', 'p', 2, 20),
+             ('b', 'r', 3, 30))
+    accumulators = OrderedDict((
+        ('count', (lambda: 0,
+                   lambda state, row: state + 1,
+                   lambda state: state)),
+        ('sumbarbaz', (('bar', 'baz'),
+                       lambda: 0,
+                       lambda state, value: state + value[0] + value[1],
+                       lambda state: state)),
+    ))
+
+    actual = aggregateaccumulate(table, ('foo', 'qux'), accumulators)
+    expect = (('foo', 'qux', 'count', 'sumbarbaz'),
+              ('a', 'p', 2, 33),
+              ('b', 'r', 1, 33))
+    ieq(expect, actual)
+
+
+def test_aggregateaccumulate_consumes_lazily():
+    events = []
+    table = TrackingTable((('foo', 'bar', 'baz'),
+                          ('a', 1, 'x'),
+                          ('a', 2, 'y'),
+                          ('b', 3, 'y'),
+                          ('b', 4, 'x')), events)
+
+    result = iter(aggregateaccumulate(
+        table, 'foo', _accumulators(events)
+    ))
+    assert next(result) == ('foo', 'count', 'mean', 'order')
+    assert events == [('header',)]
+
+    assert next(result) == ('a', 2, 1.5, 'x->y')
+    assert events == [
+        ('header',),
+        ('row', 'a', 'x'),
+        ('init', 'count'),
+        ('init', 'mean'),
+        ('init', 'order'),
+        ('update', 'count', 'a'),
+        ('update', 'mean', 1),
+        ('update', 'order', 'x'),
+        ('row', 'a', 'y'),
+        ('update', 'count', 'a'),
+        ('update', 'mean', 2),
+        ('update', 'order', 'y'),
+        ('row', 'b', 'y'),
+    ]
+    assert not any(event[:2] == ('init', 'b') for event in events)
+
+    assert next(result) == ('b', 2, 3.5, 'y->x')
+
+
+@pytest.mark.parametrize('phase, fail_init, fail_update, fail_finalize',
+                         [('initialization', True, False, False),
+                          ('update', False, True, False),
+                          ('finalization', False, False, True)])
+def test_aggregateaccumulate_failures(phase, fail_init, fail_update,
+                                      fail_finalize):
+    table = (('foo', 'bar', 'baz'),
+             ('a', 1, 'x'),
+             ('b', 2, 'y'),
+             ('b', 3, 'z'))
+    result = iter(aggregateaccumulate(
+        table, 'foo',
+        _accumulators(fail_init=fail_init, fail_update=fail_update,
+                      fail_finalize=fail_finalize)
+    ))
+    assert next(result) == ('foo', 'count', 'mean', 'order')
+
+    delivered = [next(result)]
+    with pytest.raises(AggregationError) as excinfo:
+        next(result)
+
+    error = excinfo.value
+    assert error.key == 'b'
+    assert error.metric == 'count'
+    assert error.phase == phase
+    assert all(row[0] != 'b' for row in delivered)

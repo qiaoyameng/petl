@@ -7,9 +7,10 @@ from collections import OrderedDict
 from petl.compat import next, string_types, reduce, text_type
 
 
-from petl.errors import ArgumentError
-from petl.util.base import Table, iterpeek, rowgroupby
-from petl.util.base import values
+from petl.errors import ArgumentError, AggregationError
+from petl.util.base import Table, iterpeek, rowgroupby, asindices, Record, \
+    values
+from petl.comparison import comparable_itemgetter
 from petl.util.counting import nrows
 from petl.transform.sorts import sort, mergesort
 from petl.transform.basics import cut
@@ -390,6 +391,190 @@ def itermultiaggregate(source, key, aggregation):
                 aggval = aggfun(vals)
                 outrow.append(aggval)
         yield tuple(outrow)
+
+
+def aggregateaccumulate(table, key, accumulators):
+    """Aggregate rows using independent accumulator states.
+
+    The input table is assumed to already be sorted by `key`. Each metric is
+    configured as either ``(init, update, finalize)`` for whole-row input, or
+    ``(field, init, update, finalize)`` for a selected field. `init` returns
+    the metric state for a new group, `update` receives that state and each
+    input value or row, and `finalize` returns the output value. An update
+    function may mutate and return ``None``, or return a replacement state.
+    E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 1],
+        ...           ['a', 2],
+        ...           ['b', 3]]
+        >>> def init_count():
+        ...     return 0
+        ...
+        >>> def update_count(count, row):
+        ...     return count + 1
+        ...
+        >>> def init_mean():
+        ...     return [0, 0]
+        ...
+        >>> def update_mean(state, value):
+        ...     state[0] += value
+        ...     state[1] += 1
+        ...
+        >>> def finalize_mean(state):
+        ...     total, count = state
+        ...     return total / count
+        ...
+        >>> table2 = etl.aggregateaccumulate(
+        ...     table1, 'foo',
+        ...     {'count': (init_count, update_count, lambda state: state),
+        ...      'mean': ('bar', init_mean, update_mean, finalize_mean)}
+        ... )
+        >>> list(table2)
+        [('foo', 'count', 'mean'), ('a', 2, 1.5), ('b', 1, 3.0)]
+
+    Unlike :func:`petl.transform.reductions.aggregate`, rows in a group are
+    scanned only once and are not converted to a list. A completed output row
+    is produced only when the next group starts or iteration ends.
+
+    """
+
+    return AccumulatingAggregateView(table, key, accumulators)
+
+
+Table.aggregateaccumulate = aggregateaccumulate
+
+
+class AccumulatingAggregateView(Table):
+
+    def __init__(self, table, key, accumulators):
+        if key is None:
+            raise ArgumentError('key is required for accumulator aggregation')
+        self.table = table
+        self.key = key
+        if isinstance(accumulators, (list, tuple)):
+            self.accumulators = OrderedDict()
+            for name, accumulator in accumulators:
+                self.accumulators[name] = accumulator
+        elif isinstance(accumulators, dict):
+            self.accumulators = accumulators
+        else:
+            raise ArgumentError(
+                'expected accumulators is list, tuple or dict, found %r'
+                % accumulators
+            )
+
+    def __iter__(self):
+        return iteraccumulateaggregate(
+            self.table, self.key, self.accumulators
+        )
+
+    def __setitem__(self, key, value):
+        self.accumulators[key] = value
+
+
+def iteraccumulateaggregate(table, key, accumulators):
+    accumulators = OrderedDict(accumulators.items())
+    it = iter(table)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+
+    normalized = OrderedDict()
+    for metric, accumulator in accumulators.items():
+        accumulator = tuple(accumulator)
+        if len(accumulator) == 3 and callable(accumulator[0]):
+            srcfld = None
+            init, update, finalize = accumulator
+        elif len(accumulator) == 4:
+            srcfld, init, update, finalize = accumulator
+        else:
+            raise ArgumentError(
+                'invalid accumulator: %r, %r' % (metric, accumulator)
+            )
+        if not callable(init) or not callable(update) or not callable(finalize):
+            raise ArgumentError(
+                'invalid accumulator: %r, %r' % (metric, accumulator)
+            )
+        if srcfld is None:
+            getvalue = None
+        else:
+            indices = asindices(hdr, srcfld)
+            getvalue = operator.itemgetter(*indices)
+        normalized[metric] = (srcfld, getvalue, init, update, finalize)
+
+    if callable(key):
+        outhdr = ['key']
+    else:
+        outhdr = list(key) if isinstance(key, (list, tuple)) else [key]
+    outhdr.extend(normalized)
+    yield tuple(outhdr)
+
+    flds = list(map(text_type, hdr))
+    if callable(key):
+        getgroupkey = lambda row: key(Record(row, flds))
+    else:
+        keyindices = asindices(hdr, key)
+        getrawgroupkey = comparable_itemgetter(*keyindices)
+        getgroupkey = lambda row: getrawgroupkey(row).inner
+
+    currentkey = None
+    states = None
+
+    def initialize(groupkey):
+        initialized = OrderedDict()
+        for metric, accumulator in normalized.items():
+            srcfld, getvalue, init, update, finalizefn = accumulator
+            try:
+                initialized[metric] = init()
+            except Exception as cause:
+                raise AggregationError(
+                    groupkey, metric, 'initialization', cause
+                )
+        return initialized
+
+    def consume(groupkey, groupstates, row):
+        record = Record(row, flds)
+        for metric, accumulator in normalized.items():
+            srcfld, getvalue, init, updatefn, finalizefn = accumulator
+            value = record if getvalue is None else getvalue(record)
+            try:
+                new_state = updatefn(groupstates[metric], value)
+            except Exception as cause:
+                raise AggregationError(groupkey, metric, 'update', cause)
+            if new_state is not None:
+                groupstates[metric] = new_state
+
+    def finalize(groupkey, groupstates):
+        outrow = list(groupkey) if isinstance(key, (list, tuple)) \
+            else [groupkey]
+        for metric, accumulator in normalized.items():
+            srcfld, getvalue, init, updatefn, finalizefn = accumulator
+            try:
+                outrow.append(finalizefn(groupstates[metric]))
+            except Exception as cause:
+                raise AggregationError(
+                    groupkey, metric, 'finalization', cause
+                )
+        return tuple(outrow)
+
+    for row in it:
+        groupkey = getgroupkey(row)
+        if states is None:
+            currentkey = groupkey
+            states = initialize(currentkey)
+        elif groupkey != currentkey:
+            yield finalize(currentkey, states)
+            currentkey = groupkey
+            states = initialize(currentkey)
+            consume(currentkey, states, row)
+            continue
+        consume(currentkey, states, row)
+
+    if states is not None:
+        yield finalize(currentkey, states)
 
 
 def groupcountdistinctvalues(table, key, value):
