@@ -26,3 +26,17 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class AggregationError(Exception):
+
+    def __init__(self, phase, key, field, error):
+        self.phase = phase
+        self.key = key
+        self.field = field
+        self.metric = field
+        self.error = error
+
+    def __str__(self):
+        return ('aggregation %s failed for key %r and field %r: %s'
+                % (self.phase, self.key, self.field, self.error))

@@ -7,8 +7,8 @@ from collections import OrderedDict
 from petl.compat import next, string_types, reduce, text_type
 
 
-from petl.errors import ArgumentError
-from petl.util.base import Table, iterpeek, rowgroupby
+from petl.errors import AggregationError, ArgumentError
+from petl.util.base import Record, Table, asindices, iterpeek, rowgroupby
 from petl.util.base import values
 from petl.util.counting import nrows
 from petl.transform.sorts import sort, mergesort
@@ -232,6 +232,212 @@ def aggregate(table, key, aggregation=None, value=None, presorted=False,
 
 
 Table.aggregate = aggregate
+
+
+def aggregate_accumulators(table, key, accumulators):
+    """Aggregate sorted rows using independent accumulator states.
+
+    Each accumulator is described by an output field and three operations:
+    an initialiser, a row update function and a finaliser. The update function
+    is called as ``update(state, value)``. If it returns a value other than
+    ``None`` that value replaces the current state, allowing both mutable and
+    immutable accumulators. E.g.::
+
+        >>> from collections import OrderedDict
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', 7],
+        ...           ['b', 2],
+        ...           ['b', 9]]
+        >>> accumulators = OrderedDict()
+        >>> accumulators['count'] = (None,
+        ...                         lambda: 0,
+        ...                         lambda state, row: state + 1,
+        ...                         lambda state: state)
+        >>> def update_mean(state, value):
+        ...     state[0] += value
+        ...     state[1] += 1
+        ...     return state
+        ...
+        >>> accumulators['mean'] = (
+        ...     'bar', lambda: [0, 0], update_mean,
+        ...     lambda state: state[0] / state[1])
+        >>> table2 = etl.aggregate_accumulators(table1, 'foo', accumulators)
+        >>> table2
+        +-----+-------+------+
+        | foo | count | mean |
+        +=====+=======+======+
+        | 'a' |     2 |  5.0 |
+        +-----+-------+------+
+        | 'b' |     2 |  5.5 |
+        +-----+-------+------+
+
+    The table must already be sorted by `key`; unlike :func:`aggregate` this
+    function does not sort its input. Rows in a group are consumed only once
+    and a group is emitted when the next group starts, or when the input is
+    exhausted. Failures from initialisation, updates or finalisation raise
+    :class:`petl.errors.AggregationError` containing the group key and output
+    field name.
+
+    """
+
+    return AccumulatorAggregateView(table, key, accumulators)
+
+
+Table.aggregate_accumulators = aggregate_accumulators
+
+
+class AccumulatorAggregateView(Table):
+
+    def __init__(self, table, key, accumulators):
+        self.table = table
+        self.key = key
+        self.accumulators = normalise_accumulators(accumulators)
+
+    def __iter__(self):
+        return iteraggregateaccumulators(self.table, self.key,
+                                         self.accumulators)
+
+
+def normalise_accumulators(accumulators):
+    if isinstance(accumulators, dict):
+        normalised = OrderedDict(accumulators)
+    elif isinstance(accumulators, (list, tuple)):
+        normalised = OrderedDict()
+        for accumulator in accumulators:
+            if (not isinstance(accumulator, (list, tuple))
+                    or len(accumulator) < 4 or len(accumulator) > 5):
+                raise ArgumentError(
+                    'expected accumulator as (field, source, init, update, '
+                    'finalize), found %r' % (accumulator,))
+            normalised[accumulator[0]] = tuple(accumulator[1:])
+    else:
+        raise ArgumentError('expected accumulators as dict, list or tuple')
+
+    for field, accumulator in normalised.items():
+        if len(accumulator) == 3:
+            source, init, update = accumulator
+            finalize = None
+        else:
+            source, init, update, finalize = accumulator
+
+        if source is not None and not isinstance(
+                source, (list, tuple) + (string_types, int)):
+            raise ArgumentError(
+                'invalid accumulator source for %r: %r' % (field, source))
+        if not callable(init) or not callable(update):
+            raise ArgumentError(
+                'expected init and update to be callable for %r' % field)
+        if finalize is not None and not callable(finalize):
+            raise ArgumentError(
+                'expected finalize to be callable for %r' % field)
+        normalised[field] = (source, init, update, finalize)
+
+    return normalised
+
+
+def iteraggregateaccumulators(source, key, accumulators):
+    accumulators = OrderedDict(accumulators.items())
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+
+    if isinstance(key, (list, tuple)):
+        outhdr = list(key)
+        key_indices = asindices(hdr, key)
+        get_key = operator.itemgetter(*key_indices)
+    elif callable(key):
+        outhdr = ['key']
+        get_key = key
+    elif key is None:
+        outhdr = []
+        get_key = lambda row: None
+    else:
+        outhdr = [key]
+        key_indices = asindices(hdr, key)
+        get_key = operator.itemgetter(*key_indices)
+
+    fields = list(map(text_type, hdr))
+    value_getters = OrderedDict()
+    for outfield, (srcfield, _, _, _) in accumulators.items():
+        outhdr.append(outfield)
+        if srcfield is None:
+            value_getters[outfield] = None
+        else:
+            indices = asindices(hdr, srcfield)
+            value_getters[outfield] = operator.itemgetter(*indices)
+
+    yield tuple(outhdr)
+
+    def initialise(group_key):
+        states = OrderedDict()
+        for outfield, (_, init, _, _) in accumulators.items():
+            try:
+                states[outfield] = init()
+            except Exception as err:
+                error = AggregationError('initialization', group_key,
+                                         outfield, err)
+                error.__cause__ = err
+                raise error
+        return states
+
+    def finalise(group_key, states):
+        outrow = group_prefix(group_key)
+        for outfield, (_, _, _, finalize) in accumulators.items():
+            try:
+                if finalize is None:
+                    value = states[outfield]
+                else:
+                    value = finalize(states[outfield])
+            except Exception as err:
+                error = AggregationError('finalization', group_key,
+                                         outfield, err)
+                error.__cause__ = err
+                raise error
+            outrow.append(value)
+        return tuple(outrow)
+
+    def group_prefix(group_key):
+        if isinstance(key, (list, tuple)):
+            return list(group_key)
+        if key is None:
+            return []
+        return [group_key]
+
+    current_key = None
+    states = None
+    in_group = False
+
+    for raw_row in it:
+        row = Record(raw_row, fields)
+        group_key = get_key(row)
+
+        if in_group and group_key != current_key:
+            yield finalise(current_key, states)
+            in_group = False
+
+        if not in_group:
+            current_key = group_key
+            states = initialise(group_key)
+            in_group = True
+
+        for outfield, (_, _, update, _) in accumulators.items():
+            value_getter = value_getters[outfield]
+            value = row if value_getter is None else value_getter(row)
+            try:
+                new_state = update(states[outfield], value)
+            except Exception as err:
+                error = AggregationError('update', group_key, outfield, err)
+                error.__cause__ = err
+                raise error
+            if new_state is not None:
+                states[outfield] = new_state
+
+    if in_group:
+        yield finalise(current_key, states)
 
 
 class SimpleAggregateView(Table):

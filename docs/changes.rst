@@ -1,6 +1,13 @@
 Changes
 =======
 
+Version 1.7.29
+--------------
+
+* Add ``aggregate_accumulators()`` for streaming multiple independent
+  accumulators over pre-sorted groups in a single pass, with group key and
+  metric context on initialisation, update and finalisation failures.
+
 Version 1.7.28
 --------------
 

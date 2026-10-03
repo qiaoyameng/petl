@@ -111,6 +111,18 @@ def test_rowreduce_header():
     eq_(('foo',), t.header())
 
 
+def test_aggregate_accumulators_header():
+    src = etl.wrap([['foo', 'bar'], ['a', 2]])
+    accumulators = OrderedDict([
+        ('count', (None,
+                   lambda: 0,
+                   lambda state, row: state + 1,
+                   None))
+    ])
+    t = src.aggregate_accumulators('foo', accumulators)
+    eq_(('foo', 'count'), t.header())
+
+
 def test_mergesort_header():
     a = etl.wrap([['foo', 'bar'], [1, 2]])
     b = etl.wrap([['foo', 'bar'], [3, 4]])

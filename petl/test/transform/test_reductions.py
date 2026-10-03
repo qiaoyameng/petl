@@ -2,13 +2,15 @@ from __future__ import absolute_import, print_function, division
 
 
 import operator
+import pytest
 
 
 from collections import OrderedDict
+from petl.errors import AggregationError
 from petl.test.helpers import ieq
 from petl.util import strjoin
 from petl.transform.reductions import rowreduce, aggregate, \
-    mergeduplicates, Conflict, fold
+    aggregate_accumulators, mergeduplicates, Conflict, fold
 
 
 def test_rowreduce():
@@ -429,6 +431,161 @@ def test_aggregate_empty_key_is_None():
     actual = aggregate(table, None, aggregators)
     expect = (('minbar', 'maxbar', 'sumbar'),)
     ieq(expect, actual)
+
+
+def test_aggregate_accumulators_empty_and_header_only():
+    accumulators = OrderedDict([
+        ('count', (None,
+                   lambda: 0,
+                   lambda state, row: state + 1,
+                   None)),
+        ('mean', ('bar',
+                  lambda: (0, 0),
+                  lambda state, value: (state[0] + value, state[1] + 1),
+                  lambda state: state[0] / state[1])),
+    ])
+
+    assert list(aggregate_accumulators(iter(()), 'foo', accumulators)) == []
+
+    table = (('foo', 'bar'),)
+    expect = (('foo', 'count', 'mean'),)
+    ieq(expect, aggregate_accumulators(table, 'foo', accumulators))
+
+
+def test_aggregate_accumulators_isolated_and_single_pass():
+    table = (('foo', 'bar'),
+             ('a', 3),
+             ('a', 7),
+             ('b', 2),
+             ('b', 1),
+             ('b', 9))
+
+    accumulators = OrderedDict([
+        ('count', (None,
+                   lambda: 0,
+                   lambda state, row: state + 1,
+                   None)),
+        ('mean', ('bar',
+                  lambda: (0, 0),
+                  lambda state, value: (state[0] + value, state[1] + 1),
+                  lambda state: state[0] / state[1])),
+        ('digest', (None,
+                    lambda: '',
+                    lambda state, row: state + str(row['bar']),
+                    None)),
+    ])
+
+    actual = aggregate_accumulators(table, 'foo', accumulators)
+    expect = (('foo', 'count', 'mean', 'digest'),
+              ('a', 2, 5.0, '37'),
+              ('b', 3, 4.0, '219'))
+    ieq(expect, actual)
+    ieq(expect, actual)
+
+
+def test_aggregate_accumulators_consumes_lazily():
+    consumed = []
+
+    def source():
+        rows = (('foo', 'bar'),
+                ('a', 3),
+                ('a', 7),
+                ('b', 2),
+                ('b', 1),
+                ('c', 9))
+        for row in rows:
+            consumed.append(row)
+            yield row
+
+    accumulators = OrderedDict([
+        ('count', (None,
+                   lambda: 0,
+                   lambda state, row: state + 1,
+                   None)),
+        ('digest', (None,
+                    lambda: '',
+                    lambda state, row: state + str(row['bar']),
+                    None)),
+    ])
+    result = iter(aggregate_accumulators(source(), 'foo', accumulators))
+
+    assert next(result) == ('foo', 'count', 'digest')
+    assert consumed == [('foo', 'bar')]
+
+    assert next(result) == ('a', 2, '37')
+    assert consumed == [('foo', 'bar'),
+                        ('a', 3),
+                        ('a', 7),
+                        ('b', 2)]
+
+    assert next(result) == ('b', 2, '21')
+    assert consumed == [('foo', 'bar'),
+                        ('a', 3),
+                        ('a', 7),
+                        ('b', 2),
+                        ('b', 1),
+                        ('c', 9)]
+
+    assert next(result) == ('c', 1, '9')
+
+
+@pytest.mark.parametrize('phase', [
+    'initialization', 'update', 'finalization'
+])
+def test_aggregate_accumulators_error_context(phase):
+    table = (('foo', 'bar'),
+             ('a', 3),
+             ('b', 2),
+             ('b', 1))
+
+    init_calls = [0]
+
+    def init():
+        init_calls[0] += 1
+        if phase == 'initialization':
+            if init_calls[0] == 2:
+                raise ValueError('init failed')
+        return ''
+
+    def update(state, row):
+        if phase == 'update' and row['bar'] == 2:
+            raise ValueError('update failed')
+        return state + str(row['bar'])
+
+    def finalize(state):
+        if phase == 'finalization' and state != '3':
+            raise ValueError('finalise failed')
+        return state
+
+    accumulators = OrderedDict([
+        ('count', (None,
+                   lambda: 0,
+                   lambda state, row: state + 1,
+                   None)),
+        ('digest', (None, init, update, finalize)),
+    ])
+    result = aggregate_accumulators(table, 'foo', accumulators)
+
+    rows = []
+    with pytest.raises(AggregationError) as excinfo:
+        for row in result:
+            rows.append(row)
+
+    error = excinfo.value
+    assert error.phase == phase
+    assert error.key == 'b'
+    assert error.field == 'digest'
+    assert error.metric == 'digest'
+    assert isinstance(error.__cause__, ValueError)
+    assert rows == [('foo', 'count', 'digest'), ('a', 1, '3')]
+
+    if phase == 'initialization':
+        assert str(error.__cause__) == 'init failed'
+    elif phase == 'update':
+        assert str(error.__cause__) == 'update failed'
+    else:
+        assert str(error.__cause__) == 'finalise failed'
+
 
 def test_mergeduplicates():
 
