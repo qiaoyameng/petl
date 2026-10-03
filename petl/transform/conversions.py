@@ -1,7 +1,11 @@
 from __future__ import absolute_import, print_function, division
 
 
-from petl.compat import next, integer_types, string_types, text_type
+import os
+import sys
+from tempfile import NamedTemporaryFile
+
+from petl.compat import next, integer_types, string_types, text_type, pickle
 
 
 import petl.config as config
@@ -353,6 +357,89 @@ def convertnumbers(table, strict=False, **kwargs):
 Table.convertnumbers = convertnumbers
 
 
+def convertfork(table, *args, **kwargs):
+    """Convert values like :func:`convert`, but fork the results into two
+    independently consumable tables: rows where every conversion succeeded
+    are routed to the ``accepted`` table, and any row where a conversion
+    raised an exception is routed as a whole to the ``rejected`` table.
+    E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['A', '1'],
+        ...           ['B', 'x'],
+        ...           ['C', '3']]
+        >>> fork = etl.convertfork(table1, 'bar', int)
+        >>> # rows where all conversions succeeded
+        ... list(fork.accepted)
+        [('foo', 'bar'), ('A', 1), ('C', 3)]
+        >>> # rows where any conversion failed, reported with the data row
+        ... # number, field name, original value and error details
+        ... list(fork.rejected)
+        [('row', 'field', 'value', 'error'), (2, 'bar', 'x', "ValueError: invalid literal for int() with base 10: 'x'")]
+        >>> # release the temporary spill files
+        ... fork.close()
+
+    The two outputs may be consumed at different speeds and in any order -
+    e.g., the ``rejected`` table can be read in full before the ``accepted``
+    table, or the two can be read in an interleaved manner. The source table
+    is read at most once and each conversion function is executed at most
+    once per value, whichever output is read; rows destined for the other
+    output are buffered in temporary spill files on disk, so memory usage
+    stays bounded even if one output is consumed much faster than the other.
+
+    Rows in the ``rejected`` table have the form ``(row, field, value,
+    error)``, where ``row`` is the one-based number of the data row in the
+    source table, ``field`` is the name of the field whose conversion
+    failed, ``value`` is the original (unconverted) value, and ``error`` is
+    a string of the form ``'<exception type>: <message>'``. Only plain
+    strings are kept, so rejection records do not retain exceptions,
+    tracebacks or any business objects referenced from traceback frames.
+
+    Call :meth:`ConvertFork.close` when done to release the temporary spill
+    files - in particular if one of the outputs is abandoned before being
+    fully consumed. The result also supports the context manager protocol,
+    e.g.::
+
+        >>> with etl.convertfork(table1, 'bar', int) as fork:
+        ...     nbad = etl.nrows(fork.rejected)
+
+    Conversion specifications are the same as for :func:`convert`, and the
+    ``where``, ``pass_row`` and ``trusted`` keyword arguments are also
+    supported. Rows skipped by a ``where`` predicate are passed through to
+    the ``accepted`` table unchanged. The ``tempdir`` keyword argument can
+    be used to control where temporary spill files are created.
+
+    Note that the two outputs share a single pass over the source table and
+    are not safe to iterate concurrently from multiple threads.
+
+    """
+
+    converters = None
+    if len(args) == 0:
+        # no conversion specified, can be set afterwards via suffix notation
+        pass
+    elif len(args) == 1:
+        converters = args[0]
+    elif len(args) > 1:
+        converters = dict()
+        # assume first arg is field name or spec
+        field = args[0]
+        if len(args) == 2:
+            conv = args[1]
+        else:
+            conv = args[1:]
+        if isinstance(field, (list, tuple)):  # allow for multiple fields
+            for f in field:
+                converters[f] = conv
+        else:
+            converters[field] = conv
+    return ConvertFork(table, converters, **kwargs)
+
+
+Table.convertfork = convertfork
+
+
 class FieldConvertView(Table):
 
     def __init__(self, source, converters=None, failonerror=None,
@@ -394,42 +481,7 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
         hdr = flds = []  # converters will fail selecting a field
 
     # build converter functions
-    converter_functions = dict()
-    for k, c in converters.items():
-
-        # turn field names into row indices
-        if not isinstance(k, integer_types):
-            try:
-                k = flds.index(k)
-            except ValueError:  # not in list
-                raise FieldSelectionError(k)
-        assert isinstance(k, int), 'expected integer, found %r' % k
-
-        # is converter a function?
-        if callable(c):
-            converter_functions[k] = c
-
-        # is converter a method name?
-        elif isinstance(c, string_types):
-            converter_functions[k] = methodcaller(c)
-
-        # is converter a method name with arguments?
-        elif isinstance(c, (tuple, list)) and isinstance(c[0], string_types):
-            methnm = c[0]
-            methargs = c[1:]
-            converter_functions[k] = methodcaller(methnm, *methargs)
-
-        # is converter a dictionary?
-        elif isinstance(c, dict):
-            converter_functions[k] = dictconverter(c)
-
-        # is it something else?
-        elif c is None:
-            pass  # ignore
-        else:
-            raise ArgumentError(
-                'unexpected converter specification on field %r: %r' % (k, c)
-            )
+    converter_functions = build_converter_functions(converters, flds)
 
     # define a function to transform a value
     def transform_value(i, v, *args):
@@ -483,6 +535,47 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
                 yield row
 
 
+def build_converter_functions(converters, flds):
+    converter_functions = dict()
+    for k, c in converters.items():
+
+        # turn field names into row indices
+        if not isinstance(k, integer_types):
+            try:
+                k = flds.index(k)
+            except ValueError:  # not in list
+                raise FieldSelectionError(k)
+        assert isinstance(k, int), 'expected integer, found %r' % k
+
+        # is converter a function?
+        if callable(c):
+            converter_functions[k] = c
+
+        # is converter a method name?
+        elif isinstance(c, string_types):
+            converter_functions[k] = methodcaller(c)
+
+        # is converter a method name with arguments?
+        elif isinstance(c, (tuple, list)) and isinstance(c[0], string_types):
+            methnm = c[0]
+            methargs = c[1:]
+            converter_functions[k] = methodcaller(methnm, *methargs)
+
+        # is converter a dictionary?
+        elif isinstance(c, dict):
+            converter_functions[k] = dictconverter(c)
+
+        # is it something else?
+        elif c is None:
+            pass  # ignore
+        else:
+            raise ArgumentError(
+                'unexpected converter specification on field %r: %r' % (k, c)
+            )
+    return converter_functions
+
+
+
 def methodcaller(nm, *args):
     return lambda v: getattr(v, nm)(*args)
 
@@ -498,6 +591,252 @@ def dictconverter(d):
             # value is not hashable
             return v
     return conv
+
+
+def _exc_clear():
+    # clear any reference to the currently handled exception (and hence its
+    # traceback) held by the interpreter, so that rejection handling does
+    # not keep traceback frames - and the business objects they reference -
+    # alive; only needed on Python 2, Python 3 does this automatically
+    exc_clear = getattr(sys, 'exc_clear', None)
+    if exc_clear is not None:
+        exc_clear()
+
+
+class ConvertFork(object):
+    """Shared state driving a single pass over the source table of a
+    :func:`convertfork` operation, routing each row to one of two spill
+    files backing the ``accepted`` and ``rejected`` output tables."""
+
+    rejected_header = ('row', 'field', 'value', 'error')
+
+    def __init__(self, source, converters=None, where=None, pass_row=False,
+                 trusted=True, tempdir=None):
+        # pump state, lazily initialised on first iteration
+        self._started = False
+        self._exhausted = False
+        self._closed = False
+        self._source_it = None
+        self._flds = None
+        self._rownum = 0
+        self._transform_row = None
+        self._where = None
+        self._writers = dict()
+        self._paths = dict()
+        self.source = source
+        if converters is None:
+            self.converters = dict()
+        elif isinstance(converters, dict):
+            self.converters = converters
+        elif isinstance(converters, (tuple, list)):
+            self.converters = dict([(i, v) for i, v in enumerate(converters)])
+        else:
+            raise ArgumentError('unexpected converters: %r' % converters)
+        self.where = where
+        self.pass_row = pass_row
+        self.trusted = trusted
+        self.tempdir = tempdir
+
+    @property
+    def accepted(self):
+        """Table of rows where all conversions succeeded."""
+        return _ConvertForkTable(self, 'accepted')
+
+    @property
+    def rejected(self):
+        """Table of ``(row, field, value, error)`` rejection records."""
+        return _ConvertForkTable(self, 'rejected')
+
+    def __setitem__(self, key, value):
+        self.converters[key] = value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self):
+        """Release all temporary state held by this fork: close the spill
+        files, delete them from disk and drop the source iterator. Safe to
+        call more than once, and safe to call before either output has been
+        (fully) consumed."""
+        if self._closed:
+            return
+        self._closed = True
+        self._source_it = None
+        self._transform_row = None
+        self._where = None
+        writers = self._writers
+        self._writers = dict()
+        for w in writers.values():
+            try:
+                w.close()
+            except Exception:
+                pass
+        paths = self._paths
+        self._paths = dict()
+        for p in paths.values():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _start(self):
+        if self._closed:
+            raise RuntimeError('convertfork result has been closed')
+        if self._started:
+            return
+        self._started = True
+        # open one spill file per output
+        for channel in ('accepted', 'rejected'):
+            f = NamedTemporaryFile(mode='wb', delete=False, dir=self.tempdir,
+                                   prefix='petl-convertfork-')
+            self._paths[channel] = f.name
+            self._writers[channel] = f
+        pickle.dump(self.rejected_header, self._writers['rejected'],
+                    protocol=-1)
+        self._source_it = iter(self.source)
+        try:
+            hdr = next(self._source_it)
+        except StopIteration:
+            self._exhausted = True
+            self._source_it = None
+            self._flush()
+            return
+        flds = list(map(text_type, hdr))
+        self._flds = flds
+        pickle.dump(tuple(hdr), self._writers['accepted'], protocol=-1)
+        converter_functions = build_converter_functions(self.converters,
+                                                        flds)
+
+        # prepare where function
+        where = self.where
+        if isinstance(where, string_types):
+            where = expr(where, trusted=self.trusted)
+        elif where is not None:
+            assert callable(where), 'expected callable for "where" ' \
+                                    'argument, found %r' % where
+        self._where = where
+
+        # define a function to transform a value, capturing any error as
+        # plain strings so the rejection record does not retain the
+        # exception, its traceback, or objects referenced from its frames
+        def transform_value(i, v, *args):
+            if i not in converter_functions:
+                return v, None
+            try:
+                return converter_functions[i](v, *args), None
+            except Exception as e:
+                error = '%s: %s' % (type(e).__name__, e)
+                del e
+                _exc_clear()
+                return None, error
+
+        # define a function to transform a row, stopping at the first
+        # failing field
+        pass_row = self.pass_row
+        if pass_row:
+            def transform_row(row):
+                rec = Record(row, flds)
+                out = list()
+                for i, v in enumerate(row):
+                    newv, error = transform_value(i, v, rec)
+                    if error is not None:
+                        field = flds[i] if i < len(flds) else i
+                        return None, (field, v, error)
+                    out.append(newv)
+                return tuple(out), None
+        else:
+            def transform_row(row):
+                out = list()
+                for i, v in enumerate(row):
+                    newv, error = transform_value(i, v)
+                    if error is not None:
+                        field = flds[i] if i < len(flds) else i
+                        return None, (field, v, error)
+                    out.append(newv)
+                return tuple(out), None
+        self._transform_row = transform_row
+
+    def _flush(self):
+        for w in self._writers.values():
+            w.flush()
+
+    def _pump_one(self):
+        # consume a single row from the source, route it to the appropriate
+        # spill file, and return the channel it was routed to (or None if
+        # the source is exhausted)
+        if not self._started:
+            self._start()
+        if self._exhausted:
+            return None
+        try:
+            row = next(self._source_it)
+        except StopIteration:
+            self._exhausted = True
+            self._source_it = None
+            self._flush()
+            return None
+        self._rownum += 1
+        if self._where is not None and not self._where(Record(row,
+                                                              self._flds)):
+            # row skipped by the where predicate passes through unchanged
+            out, failure = tuple(row), None
+        else:
+            out, failure = self._transform_row(row)
+        if failure is None:
+            pickle.dump(out, self._writers['accepted'], protocol=-1)
+            return 'accepted'
+        else:
+            field, value, error = failure
+            reject = (self._rownum, field, value, error)
+            pickle.dump(reject, self._writers['rejected'], protocol=-1)
+            return 'rejected'
+
+    def _pump_until(self, channel):
+        # consume source rows until a row has been routed to the given
+        # channel (or the source is exhausted), so that a reader of that
+        # channel can make progress
+        while not self._exhausted:
+            routed = self._pump_one()
+            if routed is None:
+                break
+            if routed == channel:
+                self._writers[channel].flush()
+                return
+        self._flush()
+
+
+class _ConvertForkTable(Table):
+
+    def __init__(self, fork, channel):
+        self._fork = fork
+        self._channel = channel
+
+    def __iter__(self):
+        fork = self._fork
+        channel = self._channel
+        fork._start()
+        path = fork._paths[channel]
+        with open(path, 'rb') as f:
+            while True:
+                try:
+                    row = pickle.load(f)
+                except EOFError:
+                    if fork._exhausted:
+                        return
+                    # our channel is starved - drive the shared pump until
+                    # more rows are available for us
+                    fork._pump_until(channel)
+                else:
+                    yield row
 
 
 def format(table, field, fmt, **kwargs):

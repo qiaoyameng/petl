@@ -1,12 +1,15 @@
 from __future__ import absolute_import, print_function, division
 
+import os
+import sys
+
 import pytest
 
 from petl.errors import FieldSelectionError
 from petl.test.failonerror import assert_failonerror
 from petl.test.helpers import ieq
 from petl.transform.conversions import convert, convertall, convertnumbers, \
-    replace, update, format, interpolate
+    replace, update, format, interpolate, convertfork
 
 from functools import partial
 
@@ -400,3 +403,233 @@ def test_interpolate():
     ieq(expect, actual)
     ieq(expect, actual)
 
+
+def _convertfork_table():
+    return (('foo', 'bar'),
+            ('A', '1'),
+            ('B', 'x'),
+            ('C', '3'),
+            ('D', 'y'))
+
+
+def _check_convertfork_rejected(rejected):
+    assert rejected[0] == ('row', 'field', 'value', 'error')
+    assert len(rejected) == 3
+    assert rejected[1][:3] == (2, 'bar', 'x')
+    assert rejected[2][:3] == (4, 'bar', 'y')
+    for row in rejected[1:]:
+        # error details are captured as plain strings, not exceptions
+        assert isinstance(row[3], str)
+        assert row[3].startswith('ValueError')
+
+
+def test_convertfork():
+    # read the accepted output first, then the rejected output
+    fork = convertfork(_convertfork_table(), 'bar', int)
+    try:
+        expect_accepted = (('foo', 'bar'),
+                           ('A', 1),
+                           ('C', 3))
+        ieq(expect_accepted, fork.accepted)
+        _check_convertfork_rejected(list(fork.rejected))
+    finally:
+        fork.close()
+
+
+def test_convertfork_rejected_first():
+    # the rejected output can be fully consumed before the accepted output
+    fork = convertfork(_convertfork_table(), 'bar', int)
+    try:
+        _check_convertfork_rejected(list(fork.rejected))
+        expect_accepted = (('foo', 'bar'),
+                           ('A', 1),
+                           ('C', 3))
+        ieq(expect_accepted, fork.accepted)
+    finally:
+        fork.close()
+
+
+def test_convertfork_interleaved():
+    # the two outputs can be consumed in an interleaved manner
+    fork = convertfork(_convertfork_table(), 'bar', int)
+    try:
+        acc = iter(fork.accepted)
+        rej = iter(fork.rejected)
+        assert next(acc) == ('foo', 'bar')
+        assert next(rej) == ('row', 'field', 'value', 'error')
+        assert next(acc) == ('A', 1)
+        assert next(rej)[:3] == (2, 'bar', 'x')
+        assert next(acc) == ('C', 3)
+        assert next(rej)[:3] == (4, 'bar', 'y')
+        with pytest.raises(StopIteration):
+            next(acc)
+        with pytest.raises(StopIteration):
+            next(rej)
+    finally:
+        fork.close()
+
+
+def test_convertfork_single_pass():
+    # the source is read once and each value is converted at most once,
+    # however the outputs are consumed
+    calls = list()
+
+    def source():
+        for row in _convertfork_table():
+            yield row
+
+    def conv(v):
+        calls.append(v)
+        return int(v)
+
+    fork = convertfork(source(), 'bar', conv)
+    try:
+        rejected = list(fork.rejected)
+        accepted = list(fork.accepted)
+        # read both outputs a second time, must not re-read the source or
+        # re-run any conversion
+        assert list(fork.accepted) == accepted
+        assert list(fork.rejected) == rejected
+        assert calls == ['1', 'x', '3', 'y']
+        assert len(rejected) == 3
+        assert len(accepted) == 3
+    finally:
+        fork.close()
+
+
+def test_convertfork_close_reclaims_temp_state(tmpdir):
+    # abandon the accepted output part way through, then close - all
+    # temporary spill files must be released
+    tempdir = str(tmpdir)
+    fork = convertfork(_convertfork_table(), 'bar', int, tempdir=tempdir)
+    acc = iter(fork.accepted)
+    next(acc)
+    next(acc)
+    del acc
+    assert len(os.listdir(tempdir)) == 2
+    fork.close()
+    assert os.listdir(tempdir) == []
+    # outputs cannot be read after close
+    with pytest.raises(RuntimeError):
+        list(fork.accepted)
+    with pytest.raises(RuntimeError):
+        list(fork.rejected)
+    # close is idempotent
+    fork.close()
+
+
+def test_convertfork_context_manager(tmpdir):
+    tempdir = str(tmpdir)
+    with convertfork(_convertfork_table(), 'bar', int,
+                     tempdir=tempdir) as fork:
+        _check_convertfork_rejected(list(fork.rejected))
+        assert len(os.listdir(tempdir)) == 2
+    assert os.listdir(tempdir) == []
+
+
+def test_convertfork_abandon_rejected(tmpdir):
+    # abandon the rejected output without reading it at all
+    tempdir = str(tmpdir)
+    fork = convertfork(_convertfork_table(), 'bar', int, tempdir=tempdir)
+    expect_accepted = (('foo', 'bar'),
+                       ('A', 1),
+                       ('C', 3))
+    ieq(expect_accepted, fork.accepted)
+    fork.close()
+    assert os.listdir(tempdir) == []
+
+
+def test_convertfork_does_not_retain_exceptions():
+    fork = convertfork(_convertfork_table(), 'bar', int)
+    rejected = list(fork.rejected)
+    fork.close()
+    for row in rejected[1:]:
+        # only plain strings are kept, no exception or traceback objects
+        assert isinstance(row[3], str)
+    if sys.version_info[0] >= 3:
+        assert sys.exc_info() == (None, None, None)
+
+
+def test_convertfork_multiple_fields():
+    table = (('a', 'b'),
+             ('1', '2'),
+             ('x', '3'),
+             ('4', 'y'))
+    fork = convertfork(table, {'a': int, 'b': int})
+    try:
+        expect_accepted = (('a', 'b'),
+                           (1, 2))
+        ieq(expect_accepted, fork.accepted)
+        rejected = list(fork.rejected)
+        assert rejected[0] == ('row', 'field', 'value', 'error')
+        assert rejected[1][:3] == (2, 'a', 'x')
+        assert rejected[2][:3] == (3, 'b', 'y')
+    finally:
+        fork.close()
+
+
+def test_convertfork_where():
+    # rows skipped by the where predicate pass through unchanged
+    fork = convertfork(_convertfork_table(), 'bar', int,
+                       where=lambda r: r.foo != 'B')
+    try:
+        expect_accepted = (('foo', 'bar'),
+                           ('A', 1),
+                           ('B', 'x'),
+                           ('C', 3))
+        ieq(expect_accepted, fork.accepted)
+        rejected = list(fork.rejected)
+        assert rejected[0] == ('row', 'field', 'value', 'error')
+        assert len(rejected) == 2
+        assert rejected[1][:3] == (4, 'bar', 'y')
+    finally:
+        fork.close()
+
+
+def test_convertfork_pass_row():
+    table = (('foo', 'bar'),
+             ('A', '1'),
+             ('B', '2'))
+    fork = convertfork(table, 'bar',
+                       lambda v, row: int(v) * len(row.foo), pass_row=True)
+    try:
+        expect_accepted = (('foo', 'bar'),
+                           ('A', 1),
+                           ('B', 2))
+        ieq(expect_accepted, fork.accepted)
+        assert list(fork.rejected) == [('row', 'field', 'value', 'error')]
+    finally:
+        fork.close()
+
+
+def test_convertfork_empty():
+    fork = convertfork((('foo', 'bar'),), 'bar', int)
+    try:
+        assert list(fork.accepted) == [('foo', 'bar')]
+        assert list(fork.rejected) == [('row', 'field', 'value', 'error')]
+    finally:
+        fork.close()
+
+
+def test_convertfork_all_rejected():
+    table = (('foo', 'bar'),
+             ('A', 'x'),
+             ('B', 'y'))
+    fork = convertfork(table, 'bar', int)
+    try:
+        assert list(fork.accepted) == [('foo', 'bar')]
+        rejected = list(fork.rejected)
+        assert len(rejected) == 3
+        assert rejected[1][:3] == (1, 'bar', 'x')
+        assert rejected[2][:3] == (2, 'bar', 'y')
+    finally:
+        fork.close()
+
+
+def test_convertfork_bad_field():
+    fork = convertfork(_convertfork_table(), 'quux', int)
+    try:
+        with pytest.raises(FieldSelectionError):
+            list(fork.accepted)
+    finally:
+        fork.close()

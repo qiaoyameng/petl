@@ -51,6 +51,7 @@ Converting values
 .. autofunction:: petl.transform.conversions.convert
 .. autofunction:: petl.transform.conversions.convertall
 .. autofunction:: petl.transform.conversions.convertnumbers
+.. autofunction:: petl.transform.conversions.convertfork
 .. autofunction:: petl.transform.conversions.replace
 .. autofunction:: petl.transform.conversions.replaceall
 .. autofunction:: petl.transform.conversions.format
