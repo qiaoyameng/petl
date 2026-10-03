@@ -1,6 +1,7 @@
 from __future__ import absolute_import, print_function, division
 
 
+import gc
 from datetime import datetime
 import subprocess
 import sys
@@ -270,6 +271,192 @@ def test_recast_headerless():
     expect = []
     actual = recast(table)
     ieq(expect, actual)
+
+
+def test_recast_full_discovery():
+
+    # a variable appearing only beyond the sample is not missed
+    table = (('id', 'variable', 'value'),
+             (1, 'a', 1),
+             (2, 'a', 2),
+             (3, 'b', 3))
+
+    # default sampling mode misses 'b' with a small sample
+    result = recast(table, key='id', samplesize=2)
+    expect = (('id', 'a'),
+              (1, 1),
+              (2, 2),
+              (3, None))
+    ieq(expect, result)
+
+    # full discovery mode finds 'b'
+    result = recast(table, key='id', samplesize=None)
+    expect = (('id', 'a', 'b'),
+              (1, 1, None),
+              (2, 2, None),
+              (3, None, 3))
+    ieq(expect, result)
+
+
+def test_recast_full_discovery_column_order():
+
+    # full discovery mode orders fields by first appearance ...
+    table = (('id', 'variable', 'value'),
+             (1, 'zeta', 1),
+             (1, 'alpha', 2))
+    result = recast(table, key='id', samplesize=None)
+    expect = (('id', 'zeta', 'alpha'),
+              (1, 1, 2))
+    ieq(expect, result)
+
+    # ... while the default sampling mode sorts them
+    result = recast(table, key='id')
+    expect = (('id', 'alpha', 'zeta'),
+              (1, 2, 1))
+    ieq(expect, result)
+
+
+def test_recast_full_discovery_one_shot():
+
+    table = (('id', 'variable', 'value'),
+             (3, 'age', 16),
+             (1, 'gender', 'F'),
+             (2, 'gender', 'M'),
+             (2, 'age', 17),
+             (1, 'age', 12),
+             (3, 'gender', 'M'))
+
+    expect = (('id', 'age', 'gender'),
+              (1, 12, 'F'),
+              (2, 17, 'M'),
+              (3, 16, 'M'))
+
+    # a one-shot source works, with a tiny buffer forcing the disk path
+    result = recast((row for row in table), key='id', samplesize=None,
+                    buffersize=2)
+    ieq(expect, result)
+
+    # a normal re-readable table gives the same data
+    result = recast(table, key='id', samplesize=None, buffersize=2)
+    ieq(expect, result)
+
+    # and so does the in-memory path
+    result = recast(table, key='id', samplesize=None)
+    ieq(expect, result)
+
+
+def test_recast_full_discovery_reducers():
+
+    table = (('id', 'time', 'variable', 'value'),
+             (1, 11, 'weight', 66.4),
+             (1, 14, 'weight', 55.2),
+             (2, 12, 'weight', 53.2),
+             (2, 16, 'weight', 43.3))
+
+    # duplicate cells are listed by default
+    result = recast(table, key='id', samplesize=None)
+    expect = (('id', 'weight'),
+              (1, [66.4, 55.2]),
+              (2, [53.2, 43.3]))
+    ieq(expect, result)
+
+    # duplicate cells are passed to the reducer
+    result = recast(table, key='id', samplesize=None,
+                    reducers={'weight': max})
+    expect = (('id', 'weight'),
+              (1, 66.4),
+              (2, 53.2))
+    ieq(expect, result)
+
+
+def test_recast_full_discovery_empty():
+    table = (('foo', 'variable', 'value'),)
+    expect = (('foo',),)
+    actual = recast(table, samplesize=None)
+    ieq(expect, actual)
+
+
+def test_recast_full_discovery_headerless():
+    table = []
+    expect = []
+    actual = recast(table, samplesize=None)
+    ieq(expect, actual)
+
+
+def test_recast_full_discovery_tempfiles(tmp_path):
+    table = (('id', 'variable', 'value'),
+             (1, 'a', 1),
+             (2, 'b', 2),
+             (3, 'c', 3),
+             (4, 'd', 4))
+    tempdir = str(tmp_path)
+    result = recast(table, key='id', samplesize=None, buffersize=1,
+                    tempdir=tempdir)
+    expect = (('id', 'a', 'b', 'c', 'd'),
+              (1, 1, None, None, None),
+              (2, None, 2, None, None),
+              (3, None, None, 3, None),
+              (4, None, None, None, 4))
+    ieq(expect, result)
+    # temporary files are released once iteration completes
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_recast_full_discovery_source_error(tmp_path):
+
+    def broken():
+        yield ('id', 'variable', 'value')
+        yield (1, 'a', 1)
+        yield (2, 'b', 2)
+        raise RuntimeError('boom')
+
+    tempdir = str(tmp_path)
+    result = recast(broken(), key='id', samplesize=None, buffersize=1,
+                    tempdir=tempdir)
+    with pytest.raises(RuntimeError):
+        list(result)
+    # temporary files are released when the source raises
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_recast_full_discovery_reducer_error(tmp_path):
+    table = (('id', 'variable', 'value'),
+             (1, 'a', 1),
+             (1, 'a', 2),
+             (2, 'b', 3),
+             (3, 'c', 4))
+
+    def boom(values):
+        raise RuntimeError('boom')
+
+    tempdir = str(tmp_path)
+    result = recast(table, key='id', samplesize=None, buffersize=1,
+                    reducers={'a': boom}, tempdir=tempdir)
+    with pytest.raises(RuntimeError):
+        list(result)
+    # temporary files are released when a reducer raises
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_recast_full_discovery_consumer_close(tmp_path):
+    table = (('id', 'variable', 'value'),
+             (1, 'a', 1),
+             (2, 'b', 2),
+             (3, 'c', 3),
+             (4, 'd', 4))
+    tempdir = str(tmp_path)
+    result = recast(table, key='id', samplesize=None, buffersize=1,
+                    tempdir=tempdir)
+    it = iter(result)
+    next(it)  # header, discovery pass is done, chunks are on disk
+    assert len(list(tmp_path.iterdir())) > 0
+    it.close()
+    # temporary files are released when the consumer closes early
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_recast_date():

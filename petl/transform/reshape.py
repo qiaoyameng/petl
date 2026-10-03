@@ -1,17 +1,19 @@
 from __future__ import absolute_import, print_function, division
 
 
+import os
 import itertools
 import collections
 import operator
-from petl.compat import next, text_type
+from tempfile import NamedTemporaryFile
+from petl.compat import next, text_type, pickle
 
 
 from petl.errors import ArgumentError
 from petl.comparison import comparable_itemgetter
 from petl.util.base import Table, rowgetter, values, itervalues, \
     header, data, asindices
-from petl.transform.sorts import sort
+from petl.transform.sorts import sort, _iterchunk
 
 
 def melt(table, key=None, variables=None, variablefield='variable',
@@ -158,7 +160,8 @@ def itermelt(source, key, variables, variablefield, valuefield):
 
 
 def recast(table, key=None, variablefield='variable', valuefield='value',
-           samplesize=1000, reducers=None, missing=None):
+           samplesize=1000, reducers=None, missing=None,
+           buffersize=None, tempdir=None):
     """
     Recast molten data. E.g.::
 
@@ -258,9 +261,21 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
         |  3 | None | 'M'    |
         +----+------+--------+
 
-    Note that the table is scanned once to discover variables, then a second
-    time to reshape the data and recast variables as fields. How many rows are
-    scanned in the first pass is determined by the `samplesize` argument.
+    Note that by default the table is scanned once to discover variables,
+    then a second time to reshape the data and recast variables as fields.
+    How many rows are scanned in the first pass is determined by the
+    `samplesize` argument.
+
+    If `samplesize` is `None`, full discovery mode is enabled: all rows are
+    scanned in a single pass to discover every variable before the fixed
+    output header is emitted, so variables appearing late in the data are
+    not missed, and the source only needs to be iterable once (e.g., a
+    one-shot generator). In this mode variables are recast as fields in
+    order of first appearance. Rows are buffered in memory up to
+    `buffersize` rows; any further rows are spooled to temporary files
+    under `tempdir` (the system default location is used if `tempdir` is
+    not given). Temporary files are removed when iteration completes, is
+    closed early, or raises an exception.
 
     When the result is iterated, invalid key, variable or value field names
     raise :class:`petl.errors.ArgumentError`. The value field must exist in the
@@ -274,7 +289,8 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
 
     return RecastView(table, key=key, variablefield=variablefield,
                       valuefield=valuefield, samplesize=samplesize,
-                      reducers=reducers, missing=missing)
+                      reducers=reducers, missing=missing,
+                      buffersize=buffersize, tempdir=tempdir)
 
 
 Table.recast = recast
@@ -284,7 +300,7 @@ class RecastView(Table):
 
     def __init__(self, source, key=None, variablefield='variable',
                  valuefield='value', samplesize=1000, reducers=None,
-                 missing=None):
+                 missing=None, buffersize=None, tempdir=None):
         self.source = source
         self.key = key
         self.variablefield = variablefield
@@ -295,17 +311,17 @@ class RecastView(Table):
         else:
             self.reducers = reducers
         self.missing = missing
+        self.buffersize = buffersize
+        self.tempdir = tempdir
 
     def __iter__(self):
         return iterrecast(self.source, self.key, self.variablefield,
                           self.valuefield, self.samplesize, self.reducers,
-                          self.missing)
+                          self.missing, self.buffersize, self.tempdir)
 
 
 def iterrecast(source, key, variablefield, valuefield,
-               samplesize, reducers, missing):
-
-    # TODO only make one pass through the data
+               samplesize, reducers, missing, buffersize=None, tempdir=None):
 
     it = iter(source)
     try:
@@ -360,6 +376,17 @@ def iterrecast(source, key, variablefield, valuefield,
     keyindices = [flds.index(f) for f in keyfields]
     variableindices = [flds.index(f) for f in variablefields]
 
+    if samplesize is None:
+        # full discovery mode, scan all rows in a single pass
+        for row in _iterrecastfull(hdr, it, keyfields, keyindices,
+                                   variablefields, variableindices,
+                                   valueindex, reducers, missing,
+                                   buffersize, tempdir):
+            yield row
+        return
+
+    # TODO only make one pass through the data
+
     # determine the actual variable names to be cast as fields
     if isinstance(variablefields, dict):
         # user supplied dictionary
@@ -384,7 +411,18 @@ def iterrecast(source, key, variablefield, valuefield,
 
     # output data
 
-    source = sort(source, key=keyfields)
+    for row in _recastsecondpass(source, keyfields, keyindices,
+                                 variablefields, variableindices, variables,
+                                 valueindex, reducers, missing):
+        yield row
+
+
+def _recastsecondpass(source, keyfields, keyindices, variablefields,
+                      variableindices, variables, valueindex, reducers,
+                      missing, sortkwargs=None):
+    if sortkwargs is None:
+        sortkwargs = dict()
+    source = sort(source, key=keyfields, **sortkwargs)
     it = itertools.islice(source, 1, None)  # skip header row
     getsortablekey = comparable_itemgetter(*keyindices)
     getactualkey = operator.itemgetter(*keyindices)
@@ -417,6 +455,87 @@ def iterrecast(source, key, variablefield, valuefield,
                     val = redu(vals)
                 out_row.append(val)
         yield tuple(out_row)
+
+
+def _iterrecastfull(hdr, rows, keyfields, keyindices, variablefields,
+                    variableindices, valueindex, reducers, missing,
+                    buffersize, tempdir):
+    # discover all variables and spool the rows in a single pass over the
+    # source, so one-shot sources are supported and no variable appearing
+    # late in the data is missed
+    chunkfiles = []
+    secondpass = None
+    try:
+        if isinstance(variablefields, dict):
+            # user supplied dictionary, no discovery needed
+            variables = variablefields
+            seen = None
+        else:
+            # collect variables in order of first appearance
+            variables = collections.OrderedDict(
+                (f, []) for f in variablefields)
+            seen = dict((f, set()) for f in variablefields)
+        buffer = []
+        for row in rows:
+            if seen is not None:
+                for f, i in zip(variablefields, variableindices):
+                    v = row[i]
+                    if v not in seen[f]:
+                        seen[f].add(v)
+                        variables[f].append(v)
+            buffer.append(row)
+            if buffersize is not None and len(buffer) >= buffersize:
+                chunkfiles.append(_writechunk(buffer, tempdir))
+                del buffer[:]
+
+        # determine the output fields
+        outhdr = list(keyfields)
+        for f in variablefields:
+            outhdr.extend(variables[f])
+        yield tuple(outhdr)
+
+        # output data, reshaping the spooled rows
+        spooled = _spooledtable(hdr, chunkfiles, buffer)
+        sortkwargs = dict(buffersize=buffersize, tempdir=tempdir,
+                          cache=False)
+        secondpass = _recastsecondpass(spooled, keyfields, keyindices,
+                                       variablefields, variableindices,
+                                       variables, valueindex, reducers,
+                                       missing, sortkwargs)
+        for row in secondpass:
+            yield row
+    finally:
+        # N.B., close the second pass first, so any files it has open are
+        # released before the temporary chunk files are deleted (deletion
+        # fails on Windows if a file is still open)
+        if secondpass is not None:
+            secondpass.close()
+        _removechunks(chunkfiles)
+
+
+def _writechunk(rows, tempdir):
+    with NamedTemporaryFile(dir=tempdir, delete=False, mode='wb') as f:
+        for row in rows:
+            pickle.dump(row, f, protocol=-1)
+        f.flush()
+        return f.name
+
+
+def _removechunks(chunkfiles):
+    for fn in chunkfiles:
+        try:
+            os.remove(fn)
+        except OSError:
+            pass
+
+
+def _spooledtable(hdr, chunkfiles, buffer):
+    yield hdr
+    for fn in chunkfiles:
+        for row in _iterchunk(fn):
+            yield row
+    for row in buffer:
+        yield row
 
 
 def transpose(table):
