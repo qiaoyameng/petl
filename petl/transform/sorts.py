@@ -12,7 +12,7 @@ from petl.compat import pickle, next, text_type
 
 
 import petl.config as config
-from petl.comparison import comparable_itemgetter
+from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, asindices
 
 
@@ -23,7 +23,7 @@ debug = logger.debug
 
 
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+         cache=True, fields=None, nulls=None, missing=None):
     """
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
@@ -106,13 +106,265 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
 
+    Per-field sort specifications
+    -----------------------------
+
+    Instead of `key`/`reverse`, the `fields` argument can be used to control
+    the sort direction and the placement of empty values independently for
+    each field. E.g., sort by ``account`` ascending then ``updated_at``
+    descending, with empty dates always last::
+
+        >>> import petl as etl
+        >>> table5 = [['account', 'updated_at'],
+        ...           ['b', 2],
+        ...           ['a', 9],
+        ...           ['b', None],
+        ...           ['a', 6],
+        ...           ['a', None]]
+        >>> table6 = etl.sort(table5, fields=['account',
+        ...                                   ('updated_at', True, 'last')])
+        >>> table6
+        +---------+------------+
+        | account | updated_at |
+        +=========+============+
+        | 'a'     |          9 |
+        +---------+------------+
+        | 'a'     |          6 |
+        +---------+------------+
+        | 'a'     |       None |
+        +---------+------------+
+        | 'b'     |          2 |
+        +---------+------------+
+        | 'b'     |       None |
+        +---------+------------+
+
+    Each entry in `fields` selects a single field and may be given as:
+
+    - a field name or index, e.g. ``'account'`` (ascending); a leading
+      ``'-'`` marks descending order, e.g. ``'-updated_at'``
+    - a tuple ``(field, reverse)``, ``(field, reverse, nulls)`` or
+      ``(field, reverse, nulls, missing)``
+    - a dict, e.g. ``{'field': 'updated_at', 'reverse': True,
+      'nulls': 'last'}``
+
+    The `nulls` option controls where actual ``None`` values are placed
+    (``'first'`` or ``'last'``, default ``'first'``), independently of the
+    sort direction. The `missing` option does the same for fields that are
+    absent because a row is short, so the two cases can be told apart; by
+    default missing values are treated the same as ``None``. Both options
+    may also be given as top-level arguments to set the default for all
+    fields.
+
+    The `fields` argument cannot be combined with `key` or `reverse`, and
+    the `nulls`/`missing` arguments require `fields` - a ``ValueError``
+    is raised if old and new style arguments are mixed.
+
+    Rows whose sort keys compare equal keep their original input order
+    (the sort is stable); rows are never tie-broken by comparing whole
+    rows.
+
     """
 
-    return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
-                    tempdir=tempdir, cache=cache)
+    fieldspecs = _resolve_fieldspecs(fields, key, reverse, nulls, missing)
+    return SortView(table, key=key, reverse=reverse, fieldspecs=fieldspecs,
+                    buffersize=buffersize, tempdir=tempdir, cache=cache)
 
 
 Table.sort = sort
+
+
+# sentinel marking a field absent from a row (short row), distinct from
+# an actual None value present in the row
+_MISSING = object()
+
+
+# placement options for empty values
+_PLACEMENTS = ('first', 'last')
+
+
+class _SortFieldSpec(namedtuple('SortFieldSpec',
+                                ['field', 'reverse', 'nulls', 'missing'])):
+    """Normalised per-field sort specification."""
+
+    __slots__ = ()
+
+
+def _resolve_fieldspecs(fields, key, reverse, nulls, missing):
+    """Validate the combination of old style (`key`/`reverse`) and new style
+    (`fields`/`nulls`/`missing`) arguments and return a list of normalised
+    field specifications, or `None` if old style arguments are in use."""
+
+    if fields is None:
+        if nulls is not None or missing is not None:
+            raise ValueError(
+                "the 'nulls' and 'missing' arguments require 'fields'; "
+                "they cannot be combined with 'key'/'reverse'"
+            )
+        return None
+    if key is not None:
+        raise ValueError(
+            "the 'fields' argument cannot be combined with 'key'; "
+            "use field specifications within 'fields' instead"
+        )
+    if reverse:
+        raise ValueError(
+            "the 'fields' argument cannot be combined with 'reverse'; "
+            "set the direction on each field specification instead"
+        )
+    if nulls is not None and nulls not in _PLACEMENTS:
+        raise ValueError("invalid 'nulls' value %r, expected 'first' or "
+                         "'last'" % (nulls,))
+    if missing is not None and missing not in _PLACEMENTS:
+        raise ValueError("invalid 'missing' value %r, expected 'first' or "
+                         "'last'" % (missing,))
+    if not isinstance(fields, (list, tuple)):
+        fields = (fields,)
+    return [_parse_fieldspec(f, nulls, missing) for f in fields]
+
+
+def _parse_fieldspec(spec, nulls, missing):
+    field = spec
+    reverse = False
+    fnulls = nulls
+    fmissing = missing
+    if isinstance(spec, dict):
+        try:
+            field = spec['field']
+        except KeyError:
+            raise ValueError("field specification %r is missing the "
+                             "'field' entry" % (spec,))
+        reverse = spec.get('reverse', False)
+        fnulls = spec.get('nulls', nulls)
+        fmissing = spec.get('missing', missing)
+    elif isinstance(spec, (list, tuple)):
+        if not 1 <= len(spec) <= 4:
+            raise ValueError("invalid field specification %r, expected "
+                             "(field, reverse, nulls, missing)" % (spec,))
+        field = spec[0]
+        if len(spec) > 1:
+            reverse = spec[1]
+        if len(spec) > 2 and spec[2] is not None:
+            fnulls = spec[2]
+        if len(spec) > 3 and spec[3] is not None:
+            fmissing = spec[3]
+    elif isinstance(spec, text_type) and spec.startswith('-'):
+        field = spec[1:]
+        reverse = True
+    if not isinstance(field, (text_type, int)):
+        raise ValueError("invalid field specification %r, expected a field "
+                         "name or index, a (field, reverse, nulls, missing) "
+                         "tuple or a dict" % (spec,))
+    if fnulls is None:
+        fnulls = 'first'
+    if fnulls not in _PLACEMENTS:
+        raise ValueError("invalid 'nulls' value %r for field %r, expected "
+                         "'first' or 'last'" % (fnulls, field))
+    if fmissing is None:
+        # default is to treat missing (short row) values like None
+        fmissing = fnulls
+    if fmissing not in _PLACEMENTS:
+        raise ValueError("invalid 'missing' value %r for field %r, "
+                         "expected 'first' or 'last'" % (fmissing, field))
+    return _SortFieldSpec(field, bool(reverse), fnulls, fmissing)
+
+
+# rank of a field value within a single sort key: values in the "first"
+# group sort before ordinary values, values in the "last" group after
+_RANK_FIRST = 0
+_RANK_VALUE = 1
+_RANK_LAST = 2
+
+
+class _FieldSortKey(object):
+    """Wraps a single field value so that comparisons honour the per-field
+    sort direction and the placement of ``None`` versus missing (short row)
+    values. A sequence of these wrapped as a tuple gives a compound sort
+    key where each field is compared independently, so empty values can be
+    pinned to either end regardless of direction, and equal keys compare
+    equal (never falling back to comparing whole rows)."""
+
+    __slots__ = ('value', 'reverse', 'nulls_first', 'missing_first')
+
+    def __init__(self, value, reverse=False, nulls_first=True,
+                 missing_first=True):
+        self.value = value
+        self.reverse = reverse
+        self.nulls_first = nulls_first
+        self.missing_first = missing_first
+
+    def _rank(self):
+        value = self.value
+        if value is _MISSING:
+            return _RANK_FIRST if self.missing_first else _RANK_LAST
+        if value is None:
+            return _RANK_FIRST if self.nulls_first else _RANK_LAST
+        return _RANK_VALUE
+
+    def __lt__(self, other):
+        rank = self._rank()
+        other_rank = other._rank()
+        if rank != other_rank:
+            return rank < other_rank
+        if rank != _RANK_VALUE:
+            # both None or both missing, neither sorts before the other
+            return False
+        if self.reverse:
+            return Comparable(other.value) < Comparable(self.value)
+        return Comparable(self.value) < Comparable(other.value)
+
+    def __eq__(self, other):
+        if not isinstance(other, _FieldSortKey):
+            return NotImplemented
+        rank = self._rank()
+        if rank != other._rank():
+            return False
+        if rank != _RANK_VALUE:
+            return True
+        return self.value == other.value
+
+    def __ne__(self, other):
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return eq
+        return not eq
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __gt__(self, other):
+        return not (self < other or self == other)
+
+    def __ge__(self, other):
+        return not self < other
+
+    def __repr__(self):
+        return '_FieldSortKey(%r)' % (self.value,)
+
+
+def _fieldspecs_getter(hdr, fieldspecs):
+    """Build a key function for a sequence of normalised field
+    specifications. The same key function is used for in-memory sorting,
+    sorting chunks before writing them to disk, merging sorted chunks and
+    re-reading sorted data from the file cache."""
+
+    indices = [asindices(hdr, spec.field)[0] for spec in fieldspecs]
+    options = [(spec.reverse, spec.nulls == 'first', spec.missing == 'first')
+               for spec in fieldspecs]
+
+    def getkey(row):
+        key = list()
+        for index, (reverse, nulls_first, missing_first) in \
+                zip(indices, options):
+            try:
+                value = row[index]
+            except (IndexError, KeyError):
+                # short row, field is absent - distinguish from actual None
+                value = _MISSING
+            key.append(_FieldSortKey(value, reverse, nulls_first,
+                                     missing_first))
+        return tuple(key)
+
+    return getkey
 
 
 def _iterchunk(fn):
@@ -220,10 +472,16 @@ def _mergesorted(key=None, reverse=False, *iterables):
 
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
-                 tempdir=None, cache=True):
+                 tempdir=None, cache=True, fieldspecs=None):
         self.source = source
         self.key = key
-        self.reverse = reverse
+        self.fieldspecs = fieldspecs
+        if fieldspecs is not None:
+            # direction and empty value placement are baked into the key
+            # function, so all sorting and merging is done ascending
+            self.reverse = False
+        else:
+            self.reverse = reverse
         if buffersize is None:
             self.buffersize = config.sort_buffersize
         else:
@@ -294,13 +552,18 @@ class SortView(Table):
             hdr = []
         yield tuple(hdr)
 
-        if key is not None:
-            # convert field selection into field indices
-            indices = asindices(hdr, key)
+        if self.fieldspecs is not None:
+            # build a key function from the per-field specifications, used
+            # for in-memory sorting, chunk sorting, merging and cache reads
+            getkey = _fieldspecs_getter(hdr, self.fieldspecs)
         else:
-            indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+            if key is not None:
+                # convert field selection into field indices
+                indices = asindices(hdr, key)
+            else:
+                indices = range(len(hdr))
+            # now use field indices to construct a _getkey function
+            getkey = comparable_itemgetter(*indices)
 
         # TODO support native comparison
 

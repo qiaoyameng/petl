@@ -559,3 +559,178 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+def test_sort_fields_per_field_direction():
+    """Fields can be sorted with independent ascending/descending order."""
+
+    table = (('account', 'updated_at'),
+             ('b', 2),
+             ('a', 9),
+             ('b', None),
+             ('a', 6),
+             ('a', None))
+
+    # account ascending, updated_at descending, empty dates always last
+    expectation = (('account', 'updated_at'),
+                   ('a', 9),
+                   ('a', 6),
+                   ('a', None),
+                   ('b', 2),
+                   ('b', None))
+
+    # tuple spec
+    result = sort(table, fields=['account', ('updated_at', True, 'last')])
+    ieq(expectation, result)
+    # dict spec
+    result = sort(table, fields=['account',
+                                 {'field': 'updated_at', 'reverse': True,
+                                  'nulls': 'last'}])
+    ieq(expectation, result)
+    # '-' prefix plus top-level nulls default
+    result = sort(table, fields=['account', '-updated_at'], nulls='last')
+    ieq(expectation, result)
+
+    # default null placement is first, regardless of direction
+    expectation = (('account', 'updated_at'),
+                   ('a', None),
+                   ('a', 9),
+                   ('a', 6),
+                   ('b', None),
+                   ('b', 2))
+    result = sort(table, fields=['account', '-updated_at'])
+    ieq(expectation, result)
+
+
+def test_sort_fields_missing_vs_none():
+    """Short rows (missing fields) and actual None values can be placed
+    independently."""
+
+    table = (('a', 'b'),
+             ('x', None),
+             ('y',),  # short row, 'b' is missing
+             ('x', 1),
+             ('y', 2))
+
+    result = sort(table, fields=[{'field': 'b', 'nulls': 'last',
+                                  'missing': 'first'}])
+    expectation = (('a', 'b'),
+                   ('y',),
+                   ('x', 1),
+                   ('y', 2),
+                   ('x', None))
+    ieq(expectation, result)
+
+    result = sort(table, fields=[{'field': 'b', 'nulls': 'first',
+                                  'missing': 'last'}])
+    expectation = (('a', 'b'),
+                   ('x', None),
+                   ('x', 1),
+                   ('y', 2),
+                   ('y',))
+    ieq(expectation, result)
+
+    # by default missing is treated like None (legacy behaviour)
+    result = sort(table, fields=[{'field': 'b', 'nulls': 'last'}])
+    expectation = (('a', 'b'),
+                   ('x', 1),
+                   ('y', 2),
+                   ('x', None),
+                   ('y',))
+    ieq(expectation, result)
+
+    # placement is independent of direction
+    result = sort(table, fields=[{'field': 'b', 'reverse': True,
+                                  'nulls': 'last', 'missing': 'first'}])
+    expectation = (('a', 'b'),
+                   ('y',),
+                   ('y', 2),
+                   ('x', 1),
+                   ('x', None))
+    ieq(expectation, result)
+
+
+def test_sort_fields_mixed_arguments_rejected():
+    """Old style key/reverse and new style fields/nulls/missing arguments
+    cannot be mixed."""
+
+    table = (('a', 'b'), ('x', 1))
+
+    with pytest.raises(ValueError):
+        sort(table, key='a', fields=['a'])
+    with pytest.raises(ValueError):
+        sort(table, reverse=True, fields=['a'])
+    with pytest.raises(ValueError):
+        sort(table, key='a', nulls='last')
+    with pytest.raises(ValueError):
+        sort(table, key='a', missing='first')
+    with pytest.raises(ValueError):
+        sort(table, fields=['a'], nulls='middle')
+    with pytest.raises(ValueError):
+        sort(table, fields=[{'field': 'a', 'missing': 'nowhere'}])
+    with pytest.raises(ValueError):
+        sort(table, fields=[{'reverse': True}])
+
+
+def test_sort_fields_buffered():
+    """In-memory and external (chunked) sorts give identical results,
+    including for equal keys spanning chunk boundaries."""
+
+    # equal keys on 'k' span chunk boundaries with buffersize 2 and 3;
+    # 'seq' marks the original input order to check stability
+    table = (('k', 'seq', 'v'),) + tuple(
+        (k, i, None if i % 3 == 0 else i)
+        for i, k in enumerate(['b', 'a', 'b', 'a', 'b', 'a', 'b', 'a'])
+    )
+
+    fields = ['k', ('v', True, 'last')]
+    expect = sort(table, fields=fields)  # in-memory sort
+    for buffersize in (2, 3, 4):
+        result = sort(table, fields=fields, buffersize=buffersize)
+        ieq(expect, result)
+        # iterate a second time to exercise the file cache
+        ieq(expect, result)
+
+    # equal keys keep their original input order, across chunks
+    result = sort(table, fields=['k'], buffersize=3)
+    eq_([1, 3, 5, 7, 0, 2, 4, 6], [row[1] for row in list(result)[1:]])
+
+
+def test_sort_fields_stable():
+    """Rows with equal sort keys keep their original input order and are
+    never tie-broken by comparing whole rows."""
+
+    table = (('k', 'seq'),
+             ('a', 0),
+             ('a', 1),
+             ('a', 2),
+             ('b', 3),
+             ('b', 4))
+    result = sort(table, fields=['-k'])
+    eq_([3, 4, 0, 1, 2], [row[1] for row in list(result)[1:]])
+    result = sort(table, fields=['-k'], buffersize=2)
+    eq_([3, 4, 0, 1, 2], [row[1] for row in list(result)[1:]])
+
+
+def test_sort_fields_dates():
+    """The motivating example: account ascending, updated_at descending,
+    missing dates always last."""
+
+    from datetime import date
+    table = (('account', 'updated_at'),
+             ('b', date(2024, 5, 1)),
+             ('a', date(2024, 3, 2)),
+             ('b', None),
+             ('a', date(2024, 6, 7)),
+             ('a', None))
+    result = sort(table, fields=['account', ('updated_at', True, 'last')])
+    expectation = (('account', 'updated_at'),
+                   ('a', date(2024, 6, 7)),
+                   ('a', date(2024, 3, 2)),
+                   ('a', None),
+                   ('b', date(2024, 5, 1)),
+                   ('b', None))
+    ieq(expectation, result)
+    result = sort(table, fields=['account', ('updated_at', True, 'last')],
+                  buffersize=2)
+    ieq(expectation, result)
