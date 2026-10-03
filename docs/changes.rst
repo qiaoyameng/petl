@@ -1,6 +1,20 @@
 Changes
 =======
 
+Version 1.7.29
+--------------
+
+* Add a full-discovery mode to ``recast()``. With ``scanall=True`` every row
+  is scanned before the fixed output header is emitted, so variables that
+  first appear late in the data are no longer missed, and one-shot sources
+  (e.g. generators) need only be iterated once. Variables are emitted in
+  first-occurrence order. The ``maxrows`` argument bounds the number of rows
+  held in memory; larger inputs spill sorted chunks to temporary files (use
+  ``tempdir`` to control their location) which are merged during reshaping
+  and always removed, including when the source raises, a reducer fails or
+  the consumer abandons iteration. Empty and header-only tables produce
+  predictable output, and the default sampling behaviour is unchanged.
+
 Version 1.7.28
 --------------
 

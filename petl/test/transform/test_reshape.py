@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function, division
 
 
 from datetime import datetime
+import os
 import subprocess
 import sys
 
@@ -522,3 +523,166 @@ else:
     raise RuntimeError('recast accepted a missing value field')
 """
     subprocess.check_call([sys.executable, '-O', '-c', code])
+
+
+def _one_shot(rows):
+    # a source that can only be iterated once
+    return (row for row in rows)
+
+
+def test_recast_scanall_discovers_late_variables():
+    # the variable 'late' first appears well past the default samplesize
+    late = (1, 'late', 99)
+    rows = (('id', 'variable', 'value'),) + \
+        tuple((1, 'a', i) for i in range(1100)) + (late,) + \
+        ((2, 'a', 5),)
+
+    # sampling mode misses the late variable
+    sampled = recast(list(rows), samplesize=100)
+    assert list(sampled)[0] == ('id', 'a')
+
+    expect = (('id', 'a', 'late'),
+              (1, list(range(1100)), 99),
+              (2, 5, None))
+
+    # variables are emitted in order of first occurrence, even with a
+    # one-shot source that cannot be re-read
+    result = recast(_one_shot(rows), scanall=True)
+    ieq(expect, result)
+
+    # list() must not pre-iterate (via __len__) and drain the one-shot source
+    result = recast(_one_shot(rows), scanall=True, maxrows=50)
+    assert len(list(result)) == 3
+    with pytest.raises(TypeError):
+        len(result)
+
+    # the default sampling mode keeps the usual row-counting behaviour
+    assert len(recast(list(rows), samplesize=100)) == 3
+
+
+def test_recast_scanall_first_occurrence_order():
+    rows = (('id', 'variable', 'value'),
+            (1, 'zeta', 1),
+            (1, 'alpha', 2),
+            (2, 'zeta', 3),
+            (2, 'beta', 4))
+    expect = (('id', 'zeta', 'alpha', 'beta'),
+              (1, 1, 2, None),
+              (2, 3, None, 4))
+    ieq(expect, recast(_one_shot(rows), scanall=True))
+
+
+def test_recast_scanall_disk_equivalence():
+    # a tiny in-memory row cap forces the spill-to-disk path; results must
+    # match an ordinary re-readable table and the in-memory scanall path
+    rows = (('id', 'variable', 'value'),) + \
+        tuple((i % 7, 'v%d' % (i % 13), i) for i in range(200))
+
+    # sampling mode sorts discovered variables; scanall uses first-occurrence
+    expect_header = ('id',) + tuple('v%d' % j for j in range(13))
+    in_memory = list(recast(list(rows), scanall=True))
+    on_disk = list(recast(_one_shot(rows), scanall=True, maxrows=1))
+
+    assert in_memory[0] == expect_header
+    assert on_disk == in_memory
+
+
+def test_recast_scanall_reducers_on_disk():
+    rows = (('id', 'variable', 'value'),) + \
+        tuple((1, 'w', float(i)) for i in range(1, 31)) + \
+        ((2, 'w', 5.0),)
+    expect = (('id', 'w'),
+              (1, 30.0),
+              (2, 5.0))
+    result = recast(_one_shot(rows), key='id', reducers={'w': max},
+                    scanall=True, maxrows=7)
+    ieq(expect, result)
+
+
+def test_recast_scanall_empty_and_header_only():
+    ieq([], recast(_one_shot(()), scanall=True))
+    ieq((('foo',),), recast(_one_shot((('foo', 'variable', 'value'),)),
+                            scanall=True))
+    ieq((('foo',),), recast(_one_shot((('foo', 'variable', 'value'),)),
+                            scanall=True, maxrows=1))
+
+
+def test_recast_scanall_explicit_variables_still_work():
+    rows = (('id', 'variable', 'value'),
+            (1, 'gender', 'F'),
+            (2, 'age', 17),
+            (1, 'age', 12),
+            (3, 'gender', 'M'))
+    expect = (('id', 'gender'),
+              (1, 'F'),
+              (2, None),
+              (3, 'M'))
+    ieq(expect, recast(list(rows), key='id',
+                       variablefield={'variable': ['gender']},
+                       scanall=True))
+
+
+def test_recast_scanall_invalid_maxrows():
+    for bad in (0, -1, 1.5, True):
+        with pytest.raises(ArgumentError):
+            recast([], scanall=True, maxrows=bad)
+
+
+def test_recast_scanall_cleans_up_tempfiles():
+    import petl.transform.reshape as reshape
+
+    created = []
+    real_named_temporary_file = reshape.NamedTemporaryFile
+
+    def tracking(*args, **kwargs):
+        tmp = real_named_temporary_file(*args, **kwargs)
+        created.append(tmp.name)
+        return tmp
+
+    reshape.NamedTemporaryFile = tracking
+    try:
+        rows = (('id', 'variable', 'value'),) + \
+            tuple((i % 5, 'v%d' % (i % 3), i) for i in range(60))
+
+        # normal iteration spills and removes every file
+        result = recast(_one_shot(rows), scanall=True, maxrows=4)
+        list(result)
+        assert created
+        assert not [p for p in created if os.path.exists(p)]
+
+        # the source raising mid-stream still releases the spill files
+        del created[:]
+
+        def failing_source():
+            yield ('id', 'variable', 'value')
+            for i in range(40):
+                yield (1, 'a', i)
+            raise RuntimeError('boom')
+
+        with pytest.raises(RuntimeError):
+            list(recast(failing_source(), scanall=True, maxrows=4))
+        assert created
+        assert not [p for p in created if os.path.exists(p)]
+
+        # a failing reducer also releases the spill files
+        del created[:]
+
+        def broken_reducer(values):
+            raise ValueError('nope')
+
+        with pytest.raises(ValueError):
+            list(recast(_one_shot(rows), key='id',
+                        reducers={'v0': broken_reducer},
+                        scanall=True, maxrows=4))
+        assert created
+        assert not [p for p in created if os.path.exists(p)]
+
+        # a consumer that abandons iteration triggers cleanup too
+        del created[:]
+        iterator = iter(recast(_one_shot(rows), scanall=True, maxrows=4))
+        next(iterator)
+        iterator.close()
+        assert created
+        assert not [p for p in created if os.path.exists(p)]
+    finally:
+        reshape.NamedTemporaryFile = real_named_temporary_file

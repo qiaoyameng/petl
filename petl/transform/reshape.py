@@ -4,14 +4,16 @@ from __future__ import absolute_import, print_function, division
 import itertools
 import collections
 import operator
-from petl.compat import next, text_type
+import os
+from tempfile import NamedTemporaryFile
+from petl.compat import next, text_type, pickle, integer_types
 
 
 from petl.errors import ArgumentError
 from petl.comparison import comparable_itemgetter
 from petl.util.base import Table, rowgetter, values, itervalues, \
     header, data, asindices
-from petl.transform.sorts import sort
+from petl.transform.sorts import sort, _iterchunk, _mergesorted
 
 
 def melt(table, key=None, variables=None, variablefield='variable',
@@ -158,7 +160,8 @@ def itermelt(source, key, variables, variablefield, valuefield):
 
 
 def recast(table, key=None, variablefield='variable', valuefield='value',
-           samplesize=1000, reducers=None, missing=None):
+           samplesize=1000, reducers=None, missing=None, scanall=False,
+           maxrows=None, tempdir=None):
     """
     Recast molten data. E.g.::
 
@@ -262,6 +265,23 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
     time to reshape the data and recast variables as fields. How many rows are
     scanned in the first pass is determined by the `samplesize` argument.
 
+    By default only the first `samplesize` rows are inspected when
+    discovering variables, so variables that first appear later in the data
+    are missed. Set `scanall` to ``True`` to scan every row before the fixed
+    output header is emitted, so that no variable is missed. This supports
+    sources that can only be iterated once, e.g. generators; the rows are
+    buffered during the discovery pass and are not read from the source a
+    second time.
+
+    When `scanall` is ``True``, at most `maxrows` rows are held in memory at
+    once (``None`` means no limit). If more than `maxrows` rows are buffered,
+    sorted chunks are spilled to temporary files on disk - use the `tempdir`
+    argument to control where they are written - and merged during the
+    reshaping pass. Spill files are always removed when iteration finishes,
+    including when the source raises an error, a reducer fails or the
+    consumer stops iterating early. Variables are emitted in the order in
+    which they first occur in the data.
+
     When the result is iterated, invalid key, variable or value field names
     raise :class:`petl.errors.ArgumentError`. The value field must exist in the
     input header and must not also be selected as a key or variable field.
@@ -274,7 +294,8 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
 
     return RecastView(table, key=key, variablefield=variablefield,
                       valuefield=valuefield, samplesize=samplesize,
-                      reducers=reducers, missing=missing)
+                      reducers=reducers, missing=missing, scanall=scanall,
+                      maxrows=maxrows, tempdir=tempdir)
 
 
 Table.recast = recast
@@ -284,7 +305,7 @@ class RecastView(Table):
 
     def __init__(self, source, key=None, variablefield='variable',
                  valuefield='value', samplesize=1000, reducers=None,
-                 missing=None):
+                 missing=None, scanall=False, maxrows=None, tempdir=None):
         self.source = source
         self.key = key
         self.variablefield = variablefield
@@ -295,11 +316,34 @@ class RecastView(Table):
         else:
             self.reducers = reducers
         self.missing = missing
+        self.scanall = scanall
+        if maxrows is not None:
+            is_bool = isinstance(maxrows, bool)
+            if not isinstance(maxrows, integer_types) or is_bool \
+                    or maxrows < 1:
+                raise ArgumentError('maxrows must be a positive integer or '
+                                    'None')
+        self.maxrows = maxrows
+        self.tempdir = tempdir
 
     def __iter__(self):
+        if self.scanall:
+            return _iterrecastscanall(self.source, self.key,
+                                      self.variablefield, self.valuefield,
+                                      self.reducers, self.missing,
+                                      self.maxrows, self.tempdir)
         return iterrecast(self.source, self.key, self.variablefield,
                           self.valuefield, self.samplesize, self.reducers,
                           self.missing)
+
+    def __len__(self):
+        if self.scanall:
+            # don't let list() and friends pre-iterate the view: the source
+            # may only be iterable once, so consuming it to count rows would
+            # leave nothing for the actual iteration (raising TypeError opts
+            # out of the length-hint protocol)
+            raise TypeError('object has no len()')
+        return super(RecastView, self).__len__()
 
 
 def iterrecast(source, key, variablefield, valuefield,
@@ -312,6 +356,36 @@ def iterrecast(source, key, variablefield, valuefield,
         hdr = next(it)
     except StopIteration:
         return
+    flds, keyfields, variablefields, valueindex, keyindices, \
+        variableindices = _recastfields(hdr, key, variablefield, valuefield)
+
+    # determine the actual variable names to be cast as fields
+    if isinstance(variablefields, dict):
+        # user supplied dictionary
+        variables = variablefields
+    else:
+        variables = collections.defaultdict(set)
+        # sample the data to discover variables to be cast as fields
+        for row in itertools.islice(it, 0, samplesize):
+            for i, f in zip(variableindices, variablefields):
+                variables[f].add(row[i])
+        for f in variables:
+            # turn from sets to sorted lists
+            variables[f] = sorted(variables[f])
+
+    # finished the first pass
+
+    source = sort(source, key=keyfields)
+    it = itertools.islice(source, 1, None)  # skip header row
+    for out_row in _iterrecastgroups(it, keyfields, variablefields,
+                                    variables, valueindex, keyindices,
+                                    variableindices, reducers, missing):
+        yield out_row
+
+
+def _recastfields(hdr, key, variablefield, valuefield):
+    """Normalise and validate the key/variable/value field selections."""
+
     flds = list(map(text_type, hdr))
 
     # normalise some stuff
@@ -358,23 +432,19 @@ def iterrecast(source, key, variablefield, valuefield,
     # we'll need these later
     valueindex = flds.index(valuefield)
     keyindices = [flds.index(f) for f in keyfields]
-    variableindices = [flds.index(f) for f in variablefields]
-
-    # determine the actual variable names to be cast as fields
     if isinstance(variablefields, dict):
-        # user supplied dictionary
-        variables = variablefields
+        variableindices = [flds.index(f) for f in variablefields]
     else:
-        variables = collections.defaultdict(set)
-        # sample the data to discover variables to be cast as fields
-        for row in itertools.islice(it, 0, samplesize):
-            for i, f in zip(variableindices, variablefields):
-                variables[f].add(row[i])
-        for f in variables:
-            # turn from sets to sorted lists
-            variables[f] = sorted(variables[f])
+        variableindices = [flds.index(f) for f in variablefields]
+    return flds, keyfields, variablefields, valueindex, keyindices, \
+        variableindices
 
-    # finished the first pass
+
+def _iterrecastgroups(rows, keyfields, variablefields, variables,
+                      valueindex, keyindices, variableindices,
+                      reducers, missing):
+    """Yield the output header followed by reshaped rows from `rows`,
+    which are assumed to already be sorted by the key fields."""
 
     # determine the output fields
     outhdr = list(keyfields)
@@ -382,20 +452,16 @@ def iterrecast(source, key, variablefield, valuefield,
         outhdr.extend(variables[f])
     yield tuple(outhdr)
 
-    # output data
-
-    source = sort(source, key=keyfields)
-    it = itertools.islice(source, 1, None)  # skip header row
     getsortablekey = comparable_itemgetter(*keyindices)
     getactualkey = operator.itemgetter(*keyindices)
 
     # process sorted data in newfields
-    groups = itertools.groupby(it, key=getsortablekey)
+    groups = itertools.groupby(rows, key=getsortablekey)
     for _, group in groups:
         # may need to iterate over the group more than once
         group = list(group)
         # N.B., key returned by groupby may be wrapped as SortableItem, we want
-        # to output the actual key value, get it from the first row in the group
+        # to output the actual key value, get it from the first row in group
         key_value = getactualkey(group[0])
         if len(keyfields) > 1:
             out_row = list(key_value)
@@ -417,6 +483,136 @@ def iterrecast(source, key, variablefield, valuefield,
                     val = redu(vals)
                 out_row.append(val)
         yield tuple(out_row)
+
+
+class _RowSpill(object):
+    """Buffer rows in memory, spilling sorted chunks to temporary files
+    once more than `maxrows` rows are buffered. At most `maxrows` rows are
+    held in memory at any time. Temporary files are deleted on cleanup."""
+
+    def __init__(self, getkey, maxrows=None, tempdir=None):
+        self.getkey = getkey
+        self.maxrows = maxrows
+        self.tempdir = tempdir
+        self.rows = []
+        self.files = []
+
+    def add(self, row):
+        self.rows.append(tuple(row))
+        if self.maxrows is not None and len(self.rows) >= self.maxrows:
+            self.flush()
+
+    def flush(self):
+        if not self.rows:
+            return
+        self.rows.sort(key=self.getkey)
+        with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                mode='wb') as tmp:
+            wrapper = _SpillFileDeleteOnClose(tmp.name)
+            for row in self.rows:
+                pickle.dump(row, tmp, protocol=-1)
+            tmp.flush()
+            self.files.append(wrapper)
+        self.rows = []
+
+    def iterrows(self):
+        """Iterate all buffered rows in key order, without caching them."""
+
+        if not self.files:
+            self.rows.sort(key=self.getkey)
+            for row in self.rows:
+                yield row
+            return
+
+        # flush any rows still held in memory as a final sorted chunk
+        self.flush()
+        chunkiters = [_iterchunk(f.name) for f in self.files]
+        try:
+            for row in _mergesorted(self.getkey, False, *chunkiters):
+                yield row
+        finally:
+            # close open chunk files before deleting them (matters on
+            # Windows where an open file cannot be deleted)
+            del chunkiters
+
+    def cleanup(self):
+        for f in self.files:
+            f.delete()
+        self.files = []
+        self.rows = []
+
+
+class _SpillFileDeleteOnClose(object):
+
+    def __init__(self, name):
+        self.name = name
+
+    def delete(self, unlink=os.unlink):
+        try:
+            unlink(self.name)
+        except OSError:
+            pass
+
+
+def _iterrecastscanall(source, key, variablefield, valuefield,
+                       reducers, missing, maxrows, tempdir):
+
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+    flds, keyfields, variablefields, valueindex, keyindices, \
+        variableindices = _recastfields(hdr, key, variablefield, valuefield)
+
+    # variables supplied explicitly: nothing to discover, fall back to the
+    # regular two-pass behaviour (the source is re-readable by definition)
+    if isinstance(variablefields, dict):
+        variables = variablefields
+        source = sort(source, key=keyfields)
+        rows = itertools.islice(source, 1, None)  # skip header row
+        for out_row in _iterrecastgroups(rows, keyfields, variablefields,
+                                         variables, valueindex, keyindices,
+                                         variableindices, reducers, missing):
+            yield out_row
+        return
+
+    # delegate to a generator that owns the spill files, so they are not
+    # released before the output body is consumed
+    for out_row in _iterrecastscanallrows(
+            it, keyfields, variablefields, valueindex, keyindices,
+            variableindices, reducers, missing, maxrows, tempdir):
+        yield out_row
+
+
+def _iterrecastscanallrows(it, keyfields, variablefields, valueindex,
+                           keyindices, variableindices, reducers, missing,
+                           maxrows, tempdir):
+    # single discovery pass: record variables in first-occurrence order while
+    # buffering the rows, spilling to disk under the in-memory row cap
+    variables = collections.OrderedDict(
+        (f, []) for f in variablefields)
+    seen = dict((f, set()) for f in variablefields)
+    getkey = comparable_itemgetter(*keyindices)
+    spill = _RowSpill(getkey, maxrows=maxrows, tempdir=tempdir)
+    try:
+        for row in it:
+            for f, i in zip(variablefields, variableindices):
+                variable = row[i]
+                if variable not in seen[f]:
+                    seen[f].add(variable)
+                    variables[f].append(variable)
+            spill.add(row)
+
+        rows = spill.iterrows()
+        for out_row in _iterrecastgroups(rows, keyfields, variablefields,
+                                         variables, valueindex, keyindices,
+                                         variableindices, reducers, missing):
+            yield out_row
+    finally:
+        # release spill files whether the source raised, a reducer failed or
+        # the consumer abandoned iteration partway through
+        spill.cleanup()
 
 
 def transpose(table):
