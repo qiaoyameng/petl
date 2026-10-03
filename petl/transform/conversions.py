@@ -1,13 +1,100 @@
 from __future__ import absolute_import, print_function, division
 
+import traceback
+from collections import deque
+from tempfile import TemporaryFile
 
-from petl.compat import next, integer_types, string_types, text_type
-
+from petl.compat import next, integer_types, string_types, text_type, pickle
 
 import petl.config as config
 from petl.errors import ArgumentError, FieldSelectionError
 from petl.util.base import Table, expr, fieldnames, Record
 from petl.util.parsers import numparser
+
+
+REJECTION_HEADER = ('row', 'field', 'value', 'error')
+_DONE = object()
+_NEED_DATA = object()
+
+
+def _converters_from_args(args):
+    converters = None
+    if len(args) == 0:
+        pass
+    elif len(args) == 1:
+        converters = args[0]
+    elif len(args) > 1:
+        converters = dict()
+        field = args[0]
+        if len(args) == 2:
+            conv = args[1]
+        else:
+            conv = args[1:]
+        if isinstance(field, (list, tuple)):
+            for f in field:
+                converters[f] = conv
+        else:
+            converters[field] = conv
+    return converters
+
+
+def _normalize_converters(converters):
+    if converters is None:
+        return dict()
+    if isinstance(converters, dict):
+        return converters
+    if isinstance(converters, (tuple, list)):
+        return dict([(i, v) for i, v in enumerate(converters)])
+    raise ArgumentError('unexpected converters: %r' % converters)
+
+
+def _build_converter_functions(flds, converters):
+    converter_functions = dict()
+    for k, c in converters.items():
+        if not isinstance(k, integer_types):
+            try:
+                k = flds.index(k)
+            except ValueError:
+                raise FieldSelectionError(k)
+        assert isinstance(k, int), 'expected integer, found %r' % k
+
+        if callable(c):
+            converter_functions[k] = c
+        elif isinstance(c, string_types):
+            converter_functions[k] = methodcaller(c)
+        elif isinstance(c, (tuple, list)) and isinstance(c[0], string_types):
+            methnm = c[0]
+            methargs = c[1:]
+            converter_functions[k] = methodcaller(methnm, *methargs)
+        elif isinstance(c, dict):
+            converter_functions[k] = dictconverter(c)
+        elif c is None:
+            pass
+        else:
+            raise ArgumentError(
+                'unexpected converter specification on field %r: %r' % (k, c)
+            )
+    return converter_functions
+
+
+def _prepare_where(where, trusted):
+    if isinstance(where, string_types):
+        where = expr(where, trusted=trusted)
+    elif where is not None:
+        assert callable(where), 'expected callable for "where" argument, ' \
+                                'found %r' % where
+    return where
+
+
+def _format_exception(error):
+    traceback_object = getattr(error, '__traceback__', None)
+    try:
+        return ''.join(
+            traceback.format_exception(type(error), error, traceback_object)
+        )
+    finally:
+        if hasattr(error, '__traceback__'):
+            error.__traceback__ = None
 
 
 def convert(table, *args, **kwargs):
@@ -236,29 +323,81 @@ def convert(table, *args, **kwargs):
 
     """
 
-    converters = None
-    if len(args) == 0:
-        # no conversion specified, can be set afterwards via suffix notation
-        pass
-    elif len(args) == 1:
-        converters = args[0]
-    elif len(args) > 1:
-        converters = dict()
-        # assume first arg is field name or spec
-        field = args[0]
-        if len(args) == 2:
-            conv = args[1]
-        else:
-            conv = args[1:]
-        if isinstance(field, (list, tuple)):  # allow for multiple fields
-            for f in field:
-                converters[f] = conv
-        else:
-            converters[field] = conv
+    converters = _converters_from_args(args)
     return FieldConvertView(table, converters, **kwargs)
 
 
 Table.convert = convert
+
+
+def biconvert(table, *args, **kwargs):
+    """Convert rows and separate successful rows from rejected rows.
+
+    Return a :class:`ConvertSplitResult`. ``accepted`` is a table containing
+    converted rows; ``rejected`` is a table with the header
+    ``('row', 'field', 'value', 'error')``. If any selected field raises, the
+    entire original row is rejected and no partial row is accepted. Row
+    numbers start at one for the first data row.
+
+    Each output can only be iterated once. Reading one output lazily pulls
+    and converts source rows as needed, buffering rows destined for the other
+    output. At most ``buffersize`` rows per output remain in memory; extra
+    rows are spooled to temporary files. Call ``close()`` on either output to
+    abandon that output, or call :meth:`ConvertSplitResult.close` (or use the
+    result as a context manager) to release all temporary state.
+    """
+
+    converters = _converters_from_args(args)
+    where = kwargs.pop('where', None)
+    pass_row = kwargs.pop('pass_row', False)
+    trusted = kwargs.pop('trusted', True)
+    buffersize = kwargs.pop('buffersize', 1000)
+    tempdir = kwargs.pop('tempdir', None)
+    if kwargs:
+        raise ArgumentError('unexpected keyword argument: %r'
+                            % next(iter(kwargs)))
+    if buffersize is not None and buffersize < 1:
+        raise ArgumentError('buffersize must be a positive integer or None')
+    splitter = _FieldConvertSplitter(
+        table, converters, where=where, pass_row=pass_row,
+        trusted=trusted, buffersize=buffersize, tempdir=tempdir
+    )
+    return ConvertSplitResult(splitter.accepted, splitter.rejected, splitter)
+
+
+convert_split = biconvert
+Table.biconvert = biconvert
+Table.convert_split = biconvert
+
+
+class ConvertSplitResult(tuple):
+
+    def __new__(cls, accepted, rejected, splitter):
+        return super(ConvertSplitResult, cls).__new__(cls,
+                                                      (accepted, rejected))
+
+    def __init__(self, accepted, rejected, splitter):
+        self._splitter = splitter
+
+    @property
+    def accepted(self):
+        return self[0]
+
+    @property
+    def rejected(self):
+        return self[1]
+
+    def close(self):
+        self._splitter.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.close()
+
+    def __repr__(self):
+        return '<ConvertSplitResult accepted rejected>'
 
 
 def convertall(table, *args, **kwargs):
@@ -358,14 +497,7 @@ class FieldConvertView(Table):
     def __init__(self, source, converters=None, failonerror=None,
                  errorvalue=None, where=None, pass_row=False, trusted=True):
         self.source = source
-        if converters is None:
-            self.converters = dict()
-        elif isinstance(converters, dict):
-            self.converters = converters
-        elif isinstance(converters, (tuple, list)):
-            self.converters = dict([(i, v) for i, v in enumerate(converters)])
-        else:
-            raise ArgumentError('unexpected converters: %r' % converters)
+        self.converters = _normalize_converters(converters)
         self.failonerror = (config.failonerror if failonerror is None
                                 else failonerror)
         self.errorvalue = errorvalue
@@ -381,6 +513,258 @@ class FieldConvertView(Table):
         self.converters[key] = value
 
 
+class _SpooledRowQueue(object):
+
+    def __init__(self, buffersize, tempdir):
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.memory = deque()
+        self.file = None
+        self.read_position = 0
+        self.write_position = 0
+        self.finished = False
+        self.abandoned = False
+
+    def append(self, row):
+        if self.abandoned:
+            return
+        if self.buffersize is None or len(self.memory) < self.buffersize:
+            if self.read_position == self.write_position:
+                self.memory.append(row)
+                return
+        self._ensure_file()
+        self.file.seek(self.write_position)
+        pickle.dump(row, self.file, protocol=-1)
+        self.file.flush()
+        self.write_position = self.file.tell()
+
+    def popleft(self):
+        if self.memory:
+            row = self.memory.popleft()
+            self._reset_file_if_caught_up()
+            return row
+        if self.read_position < self.write_position:
+            self.file.seek(self.read_position)
+            row = pickle.load(self.file)
+            self.read_position = self.file.tell()
+            self._reset_file_if_caught_up()
+            return row
+        if self.finished:
+            return _DONE
+        return _NEED_DATA
+
+    def finish(self):
+        self.finished = True
+
+    def abandon(self):
+        self.abandoned = True
+        self.close()
+
+    def close(self):
+        self.memory.clear()
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+        self.read_position = 0
+        self.write_position = 0
+
+    def _ensure_file(self):
+        if self.file is None:
+            self.file = TemporaryFile(mode='wb+', dir=self.tempdir)
+
+    def _reset_file_if_caught_up(self):
+        if self.file is not None and self.read_position == self.write_position:
+            self.file.seek(0)
+            self.file.truncate()
+            self.read_position = 0
+            self.write_position = 0
+
+
+class _ConvertOutput(Table):
+
+    def __init__(self, splitter, accepted):
+        self.splitter = splitter
+        self.accepted = accepted
+
+    def __iter__(self):
+        generator = self.splitter.iter_output(self.accepted)
+        self.splitter.begin_output(self.accepted, generator)
+        return generator
+
+    def __len__(self):
+        raise TypeError('split conversion outputs are one-shot iterables')
+
+    def __repr__(self):
+        return '<accepted split conversion table>' if self.accepted \
+            else '<rejected split conversion table>'
+
+    def close(self):
+        self.splitter.abandon_output(self.accepted)
+
+
+class _FieldConvertSplitter(object):
+
+    def __init__(self, source, converters, where, pass_row, trusted,
+                 buffersize, tempdir):
+        self.source = source
+        self.converters = _normalize_converters(converters)
+        self.where = where
+        self.pass_row = pass_row
+        self.trusted = trusted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.accepted = _ConvertOutput(self, True)
+        self.rejected = _ConvertOutput(self, False)
+        self.queues = {
+            True: _SpooledRowQueue(buffersize, tempdir),
+            False: _SpooledRowQueue(buffersize, tempdir),
+        }
+        self.states = {True: 'waiting', False: 'waiting'}
+        self.source_iterator = None
+        self.started = False
+        self.source_done = False
+        self.closed = False
+        self.header = ()
+        self.fields = []
+        self.converter_functions = {}
+        self.row_number = 0
+        self.iterators = {True: None, False: None}
+
+    def __del__(self):
+        self.close()
+
+    def begin_output(self, accepted, generator=None):
+        if self.closed:
+            raise RuntimeError('conversion result is closed')
+        if self.states[accepted] != 'waiting':
+            raise RuntimeError('each conversion output can be read once')
+        self.states[accepted] = 'active'
+        self.iterators[accepted] = generator
+
+    def iter_output(self, accepted):
+        self._start()
+        try:
+            yield tuple(self.header) if accepted else REJECTION_HEADER
+            while True:
+                if self.states[accepted] == 'abandoned':
+                    return
+                item = self._pull(accepted)
+                if item is _DONE:
+                    break
+                yield item
+            self.states[accepted] = 'done'
+            self._auto_close()
+        except GeneratorExit:
+            self._abandon(accepted)
+            self._auto_close()
+            raise
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            self.iterators[accepted] = None
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for queue in self.queues.values():
+            queue.close()
+        iterator = self.source_iterator
+        if iterator is not None and hasattr(iterator, 'close'):
+            try:
+                iterator.close()
+            except Exception:
+                pass
+
+    def _start(self):
+        if self.started:
+            return
+        self.source_iterator = iter(self.source)
+        try:
+            self.header = next(self.source_iterator)
+        except StopIteration:
+            self.header = ()
+            self.fields = []
+        else:
+            self.fields = list(map(text_type, self.header))
+        self.converter_functions = _build_converter_functions(
+            self.fields, self.converters
+        )
+        self.where = _prepare_where(self.where, self.trusted)
+        self.started = True
+
+    def _pull(self, wanted):
+        queue = self.queues[wanted]
+        item = queue.popleft()
+        if item is not _NEED_DATA:
+            return item
+
+        while not self.source_done:
+            try:
+                row = next(self.source_iterator)
+            except StopIteration:
+                self.source_done = True
+                break
+            self.row_number += 1
+            target, output_row = self._convert_row(row)
+            self.queues[target].append(output_row)
+            item = queue.popleft()
+            if item is not _NEED_DATA:
+                return item
+
+        self._finish_active_queues()
+        return queue.popleft()
+
+    def _convert_row(self, row):
+        record = Record(row, self.fields) \
+            if self.pass_row or self.where is not None else row
+        if self.where is not None and not self.where(record):
+            return True, tuple(record)
+
+        output_row = list(record)
+        for index, value in enumerate(record):
+            if index not in self.converter_functions:
+                continue
+            converter = self.converter_functions[index]
+            try:
+                if self.pass_row:
+                    output_row[index] = converter(value, record)
+                else:
+                    output_row[index] = converter(value)
+            except Exception as error:
+                field = self.header[index] if index < len(self.header) else index
+                return False, (
+                    self.row_number, field, value,
+                    _format_exception(error)
+                )
+        return True, tuple(output_row)
+
+    def _finish_active_queues(self):
+        for accepted, state in self.states.items():
+            if state != 'abandoned':
+                self.queues[accepted].finish()
+
+    def _abandon(self, accepted):
+        if self.states[accepted] == 'active':
+            self.states[accepted] = 'abandoned'
+            self.queues[accepted].abandon()
+
+    def abandon_output(self, accepted):
+        if self.states[accepted] in ('waiting', 'active'):
+            self.states[accepted] = 'abandoned'
+            self.queues[accepted].abandon()
+            iterator = self.iterators[accepted]
+            if iterator is not None:
+                iterator.close()
+            self._auto_close()
+
+    def _auto_close(self):
+        if all(state in ('done', 'abandoned')
+               for state in self.states.values()):
+            self.close()
+
+
 def iterfieldconvert(source, converters, failonerror, errorvalue, where,
                      pass_row, trusted):
 
@@ -393,43 +777,7 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
     except StopIteration:
         hdr = flds = []  # converters will fail selecting a field
 
-    # build converter functions
-    converter_functions = dict()
-    for k, c in converters.items():
-
-        # turn field names into row indices
-        if not isinstance(k, integer_types):
-            try:
-                k = flds.index(k)
-            except ValueError:  # not in list
-                raise FieldSelectionError(k)
-        assert isinstance(k, int), 'expected integer, found %r' % k
-
-        # is converter a function?
-        if callable(c):
-            converter_functions[k] = c
-
-        # is converter a method name?
-        elif isinstance(c, string_types):
-            converter_functions[k] = methodcaller(c)
-
-        # is converter a method name with arguments?
-        elif isinstance(c, (tuple, list)) and isinstance(c[0], string_types):
-            methnm = c[0]
-            methargs = c[1:]
-            converter_functions[k] = methodcaller(methnm, *methargs)
-
-        # is converter a dictionary?
-        elif isinstance(c, dict):
-            converter_functions[k] = dictconverter(c)
-
-        # is it something else?
-        elif c is None:
-            pass  # ignore
-        else:
-            raise ArgumentError(
-                'unexpected converter specification on field %r: %r' % (k, c)
-            )
+    converter_functions = _build_converter_functions(flds, converters)
 
     # define a function to transform a value
     def transform_value(i, v, *args):
@@ -457,12 +805,7 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
             return tuple(transform_value(i, v)
                          for i, v in enumerate(_row))
 
-    # prepare where function
-    if isinstance(where, string_types):
-        where = expr(where, trusted=trusted)
-    elif where is not None:
-        assert callable(where), 'expected callable for "where" argument, ' \
-                                'found %r' % where
+    where = _prepare_where(where, trusted=trusted)
 
     # prepare iterator
     if pass_row or where:

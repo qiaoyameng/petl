@@ -1,12 +1,15 @@
 from __future__ import absolute_import, print_function, division
 
+import gc
+import weakref
+
 import pytest
 
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.test.failonerror import assert_failonerror
 from petl.test.helpers import ieq
 from petl.transform.conversions import convert, convertall, convertnumbers, \
-    replace, update, format, interpolate
+    replace, update, format, interpolate, biconvert
 
 from functools import partial
 
@@ -325,6 +328,332 @@ def test_convert_failonerror():
             expected_output=expect_)
 
 
+class CountingSource(object):
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.iterations = 0
+        self.closed = False
+
+    def __iter__(self):
+        self.iterations += 1
+        source_iterator = iter(self.rows)
+
+        def rows():
+            try:
+                for row in source_iterator:
+                    yield row
+            except GeneratorExit:
+                self.closed = True
+                raise
+
+        return rows()
+
+
+def test_biconvert_rejected_then_accepted_spools():
+    source = CountingSource((
+        ('foo', 'bar'),
+        ('1', 'a'),
+        ('2', 'z'),
+        ('bad', 'b'),
+        ('2', 'c'),
+        ('bad2', 'd'),
+        ('3', 'e'),
+    ))
+    calls = []
+
+    def convert_foo(value):
+        calls.append(value)
+        return int(value)
+
+    result = biconvert(source, 'foo', convert_foo, buffersize=1)
+    accepted, rejected = result
+
+    rejected_iterator = iter(rejected)
+    assert next(rejected_iterator) == ('row', 'field', 'value', 'error')
+    first_error = next(rejected_iterator)
+    assert first_error[:3] == (3, 'foo', 'bad')
+    assert 'ValueError' in first_error[3]
+    assert result._splitter.queues[True].file is not None
+
+    next(rejected_iterator)
+    rejected_rows = list(rejected_iterator)
+    assert rejected_rows == []
+    accepted_rows = list(accepted)
+
+    assert accepted_rows == [
+        ('foo', 'bar'),
+        (1, 'a'),
+        (2, 'z'),
+        (2, 'c'),
+        (3, 'e'),
+    ]
+    assert calls == ['1', '2', 'bad', '2', 'bad2', '3']
+    assert source.iterations == 1
+    assert result._splitter.closed
+
+
+def test_biconvert_accepted_then_rejected():
+    source = CountingSource((
+        ('foo', 'bar'),
+        ('1', 'a'),
+        ('bad', 'b'),
+        ('2', 'c'),
+    ))
+
+    result = biconvert(source, 'foo', int, buffersize=1)
+    accepted, rejected = result
+
+    assert list(accepted) == [
+        ('foo', 'bar'),
+        (1, 'a'),
+        (2, 'c'),
+    ]
+    rejected_rows = list(rejected)
+    assert rejected_rows[0] == ('row', 'field', 'value', 'error')
+    assert rejected_rows[1][:3] == (2, 'foo', 'bad')
+    assert 'ValueError' in rejected_rows[1][3]
+    assert source.iterations == 1
+    assert result._splitter.closed
+
+
+def test_biconvert_supports_tuple_unpacking_without_result_reference():
+    accepted, rejected = biconvert((
+        ('foo',),
+        ('1',),
+        ('bad',),
+        ('2',),
+    ), 'foo', int, buffersize=1)
+
+    assert list(accepted) == [('foo',), (1,), (2,)]
+    rejected_rows = list(rejected)
+    assert rejected_rows[1][:3] == (2, 'foo', 'bad')
+
+
+def test_biconvert_outputs_can_advance_interleaved():
+    result = biconvert((
+        ('foo',),
+        ('1',),
+        ('bad1',),
+        ('2',),
+        ('bad2',),
+    ), 'foo', int, buffersize=1)
+    accepted, rejected = result
+    accepted_iterator = iter(accepted)
+    rejected_iterator = iter(rejected)
+
+    assert next(accepted_iterator) == ('foo',)
+    assert next(accepted_iterator) == (1,)
+    assert next(rejected_iterator) == ('row', 'field', 'value', 'error')
+    assert next(rejected_iterator)[:3] == (2, 'foo', 'bad1')
+    assert next(accepted_iterator) == (2,)
+    assert next(rejected_iterator)[:3] == (4, 'foo', 'bad2')
+
+    assert list(accepted_iterator) == []
+    assert list(rejected_iterator) == []
+    assert result._splitter.closed
+
+
+def test_biconvert_rejects_whole_row_and_converts_cell_once():
+    source = CountingSource((
+        ('foo', 'bar'),
+        ('1', '2'),
+        ('bad', '3'),
+    ))
+    calls = []
+
+    def convert_foo(value):
+        calls.append(('foo', value))
+        return int(value)
+
+    def convert_bar(value):
+        calls.append(('bar', value))
+        return int(value)
+
+    result = biconvert(source, {
+        'foo': convert_foo,
+        'bar': convert_bar,
+    })
+    accepted, rejected = result
+
+    rejected_rows = list(rejected)
+    accepted_rows = list(accepted)
+
+    assert accepted_rows == [('foo', 'bar'), (1, 2)]
+    assert rejected_rows[1][:3] == (2, 'foo', 'bad')
+    assert calls == [
+        ('foo', '1'),
+        ('bar', '2'),
+        ('foo', 'bad'),
+    ]
+
+
+def test_biconvert_abandon_rejected_reclaims_state():
+    source = CountingSource((
+        ('foo',),
+        ('1',),
+        ('2',),
+        ('bad',),
+        ('2',),
+        ('3',),
+    ))
+    result = biconvert(source, 'foo', int, buffersize=1)
+    accepted, rejected = result
+
+    rejected_iterator = iter(rejected)
+    next(rejected_iterator)
+    next(rejected_iterator)
+    assert result._splitter.queues[True].file is not None
+    rejected.close()
+
+    assert result._splitter.states[False] == 'abandoned'
+    assert result._splitter.queues[False].file is None
+    assert not result._splitter.closed
+    assert list(accepted) == [
+        ('foo',),
+        (1,),
+        (2,),
+        (2,),
+        (3,),
+    ]
+
+    assert result._splitter.closed
+    assert result._splitter.queues[True].file is None
+    assert source.iterations == 1
+
+
+def test_biconvert_abandon_accepted_reclaims_state():
+    source = CountingSource((
+        ('foo',),
+        ('1',),
+        ('2',),
+        ('bad',),
+    ))
+    result = biconvert(source, 'foo', int, buffersize=1)
+    accepted, rejected = result
+
+    accepted_iterator = iter(accepted)
+    assert next(accepted_iterator) == ('foo',)
+    assert next(accepted_iterator) == (1,)
+    accepted.close()
+
+    assert result._splitter.states[True] == 'abandoned'
+    rejected_rows = list(rejected)
+
+    assert result._splitter.closed
+    assert result._splitter.queues[False].file is None
+    assert rejected_rows[1][:3] == (3, 'foo', 'bad')
+
+
+def test_biconvert_close_output_stops_source():
+    source = CountingSource((
+        ('foo',),
+        ('1',),
+        ('2',),
+        ('bad',),
+        ('3',),
+        ('4',),
+    ))
+    result = biconvert(source, 'foo', int, buffersize=1)
+    accepted, rejected = result
+
+    rejected_iterator = iter(rejected)
+    next(rejected_iterator)
+    next(rejected_iterator)
+    rejected.close()
+    result.close()
+
+    assert result._splitter.closed
+    assert source.closed
+    assert source.iterations == 1
+
+
+def test_biconvert_error_does_not_retain_traceback_objects():
+
+    class Payload(object):
+        pass
+
+    sentinel = Payload()
+    sentinel_ref = weakref.ref(sentinel)
+
+    class PayloadError(Exception):
+
+        def __init__(self, payload):
+            super(PayloadError, self).__init__('payload error')
+            self.payload = payload
+
+    def convert_foo(value):
+        raise PayloadError(sentinel)
+
+    result = biconvert((('foo',), ('value',)), 'foo', convert_foo)
+    accepted, rejected = result
+    rejected_rows = list(rejected)
+    list(accepted)
+
+    assert 'PayloadError' in rejected_rows[1][3]
+    del sentinel
+    gc.collect()
+    assert sentinel_ref() is None
+
+
+def test_biconvert_outputs_are_one_shot():
+    result = biconvert((('foo',), ('1',)), 'foo', int)
+    accepted, rejected = result
+    list(accepted)
+    with pytest.raises(RuntimeError):
+        iter(accepted)
+    list(rejected)
+    with pytest.raises(RuntimeError):
+        iter(rejected)
+
+
+def test_biconvert_where_and_pass_row():
+    source = (
+        ('apply', 'value'),
+        (True, '2'),
+        (False, 'bad'),
+    )
+    result = biconvert(
+        source,
+        'value',
+        lambda value, row: int(value) if row.apply else value,
+        where=lambda row: row.apply,
+        pass_row=True,
+    )
+    accepted, rejected = result
+
+    ieq((
+        ('apply', 'value'),
+        (True, 2),
+        (False, 'bad'),
+    ), accepted)
+
+
+def test_biconvert_accepts_list_converters():
+    result = biconvert((
+        ('foo', 'bar'),
+        ('1', '2'),
+        ('bad', '3'),
+    ), [int, int])
+    accepted, rejected = result
+
+    assert list(accepted) == [
+        ('foo', 'bar'),
+        (1, 2),
+    ]
+    rejected_rows = list(rejected)
+    assert rejected_rows[1][:3] == (2, 'foo', 'bad')
+
+
+def test_biconvert_rejects_unsupported_error_options():
+    with pytest.raises(FieldSelectionError):
+        result = biconvert((), 'foo', int)
+        list(result[0])
+
+    with pytest.raises(ArgumentError):
+        biconvert((('foo',), ('1',)), 'foo', int, errorvalue=None)
+
+
 def test_replace_where():
 
     tbl1 = (('foo', 'bar'),
@@ -399,4 +728,3 @@ def test_interpolate():
     actual = interpolate(table, 'bar', '%02d')
     ieq(expect, actual)
     ieq(expect, actual)
-

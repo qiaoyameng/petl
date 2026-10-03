@@ -7,9 +7,9 @@ from petl.transform.basics import cut, cutout, movefield, cat, annex, \
 from petl.transform.headers import rename, setheader, extendheader, \
     pushheader, skip, prefixheader, suffixheader, sortheader
 
-from petl.transform.conversions import convert, convertall, replace, \
-    replaceall, update, convertnumbers, format, formatall, interpolate, \
-    interpolateall
+from petl.transform.conversions import convert, biconvert, convert_split, \
+    convertall, replace, replaceall, update, convertnumbers, format, \
+    formatall, interpolate, interpolateall
 
 from petl.transform.sorts import sort, mergesort, issorted
 

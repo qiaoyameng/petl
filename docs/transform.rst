@@ -49,6 +49,9 @@ Converting values
 -----------------
 
 .. autofunction:: petl.transform.conversions.convert
+.. autofunction:: petl.transform.conversions.biconvert
+.. autoclass:: petl.transform.conversions.ConvertSplitResult
+   :members:
 .. autofunction:: petl.transform.conversions.convertall
 .. autofunction:: petl.transform.conversions.convertnumbers
 .. autofunction:: petl.transform.conversions.replace

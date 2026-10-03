@@ -4,6 +4,10 @@ Changes
 Version 1.7.28
 --------------
 
+* Add ``biconvert()`` (also available as ``convert_split()``) to stream
+  successful converted rows and rejected rows through separately closeable
+  outputs, with bounded-memory spooling for uneven consumption.
+
 * Preserve missing-cell positions when displaying short rows with
   ``see()``, including duplicate and numeric-looking field names.
   By :user:`rastagan-git`, :issue:`726`.
