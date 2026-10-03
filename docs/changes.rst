@@ -1,6 +1,19 @@
 Changes
 =======
 
+Version 1.7.29
+--------------
+
+* ``sort()`` and ``mergesort()`` accept a ``sortkey`` argument giving
+  per-field ascending/descending direction and null placement
+  (``'first'``/``'last'``/``'auto'``), via tuples or ``SortField``. The new
+  ``short_rows`` argument distinguishes a missing field (``'fill'``,
+  ``'raise'`` or ``'distinct'``) from an explicit ``None``. The same
+  comparison rules are used for in-memory sorting, on-disk chunks, merging
+  and cache re-reads, and equal sort keys keep their original input order.
+  The legacy ``key``/``reverse`` calling style is unchanged; mixing the two
+  styles raises ``ArgumentError``.
+
 Version 1.7.28
 --------------
 

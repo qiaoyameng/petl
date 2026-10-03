@@ -8,11 +8,12 @@ import itertools
 import logging
 from collections import namedtuple
 import operator
-from petl.compat import pickle, next, text_type
+from petl.compat import pickle, next, text_type, string_types
 
 
 import petl.config as config
-from petl.comparison import comparable_itemgetter
+from petl.comparison import sortable_itemgetter
+from petl.errors import ArgumentError
 from petl.util.base import Table, asindices
 
 
@@ -22,8 +23,102 @@ info = logger.info
 debug = logger.debug
 
 
-def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+_NULLS_FIRST = 'first'
+_NULLS_LAST = 'last'
+_NULLS_AUTO = 'auto'
+_VALID_NULLS = (_NULLS_FIRST, _NULLS_LAST, _NULLS_AUTO)
+
+_SHORT_FILL = 'fill'
+_SHORT_RAISE = 'raise'
+_SHORT_DISTINCT = 'distinct'
+_VALID_SHORT_ROWS = (_SHORT_FILL, _SHORT_RAISE, _SHORT_DISTINCT)
+
+
+class SortField(namedtuple('SortField', ['field', 'reverse', 'nulls'])):
+    """Specification of a single sort key field.
+
+    `field` is a field name or index, `reverse` is ``True`` for descending
+    order and `nulls` is one of ``'first'``, ``'last'`` or ``'auto'``
+    (``'auto'`` places null values first when ascending and last when
+    descending).
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, field, reverse=False, nulls=_NULLS_AUTO):
+        return super(SortField, cls).__new__(cls, field, reverse, nulls)
+
+
+def _as_bool_direction(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, string_types):
+        token = value.strip().lower()
+        if token in ('asc', 'ascending'):
+            return False
+        if token in ('desc', 'descending'):
+            return True
+    raise ArgumentError(
+        "sort direction must be True/False or 'asc'/'desc', found %r"
+        % (value,))
+
+
+def _check_nulls(value):
+    if value not in _VALID_NULLS:
+        raise ArgumentError(
+            "nulls must be one of 'first', 'last' or 'auto', found %r"
+            % (value,))
+
+
+def _check_short_rows(value):
+    if value not in _VALID_SHORT_ROWS:
+        raise ArgumentError(
+            "short_rows must be one of 'fill', 'raise' or 'distinct', "
+            "found %r" % (value,))
+
+
+def _parse_sortkey(sortkey, default_nulls):
+    """Normalise a user-provided sortkey into a list of
+    ``(field, descending, nulls)`` tuples."""
+    if isinstance(sortkey, SortField):
+        sortkey = [sortkey]
+    elif not isinstance(sortkey, (list, tuple)):
+        sortkey = [sortkey]
+    specs = []
+    for item in sortkey:
+        if isinstance(item, SortField):
+            field, descending, nulls = item
+            descending = _as_bool_direction(descending)
+        elif isinstance(item, (list, tuple)) and not isinstance(
+                item, string_types):
+            if len(item) == 1:
+                field = item[0]
+                descending = False
+                nulls = default_nulls
+            elif len(item) == 2:
+                field, direction = item
+                descending = _as_bool_direction(direction)
+                nulls = default_nulls
+            elif len(item) == 3:
+                field, direction, nulls = item
+                descending = _as_bool_direction(direction)
+            else:
+                raise ArgumentError(
+                    'sortkey field spec must have 1, 2 or 3 elements, '
+                    'found %r' % (item,))
+        else:
+            field = item
+            descending = False
+            nulls = default_nulls
+        _check_nulls(nulls)
+        specs.append((field, descending, nulls))
+    if not specs:
+        raise ArgumentError('sortkey must contain at least one field')
+    return specs
+
+
+def sort(table, key=None, reverse=False, sortkey=None, nulls=_NULLS_AUTO,
+         short_rows=_SHORT_FILL, buffersize=None, tempdir=None, cache=True):
     """
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
@@ -85,12 +180,57 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
         | 'F' |   1 |
         +-----+-----+
 
+    Per-field ascending/descending order and null placement can be given via
+    the `sortkey` argument, e.g. to sort an accounting export by account
+    ascending then ``updated_at`` descending, with missing dates placed last
+    within each account::
+
+        >>> table5 = [['account', 'updated_at'],
+        ...           ['B', None],
+        ...           ['A', 3],
+        ...           ['A', 9],
+        ...           ['C', 2]]
+        >>> table6 = etl.sort(table5,
+        ...                   sortkey=['account',
+        ...                            ('updated_at', 'desc', 'last')])
+        >>> table6
+        +---------+------------+
+        | account | updated_at |
+        +=========+============+
+        | 'A'     |          9 |
+        +---------+------------+
+        | 'A'     |          3 |
+        +---------+------------+
+        | 'B'     | None       |
+        +---------+------------+
+        | 'C'     |          2 |
+        +---------+------------+
+
+    Each element of `sortkey` may be a bare field name/index, a
+    ``(field, reverse)`` or ``(field, reverse, nulls)`` tuple, or a
+    :class:`SortField`. Direction may be ``True``/``False`` or the strings
+    ``'asc'``/``'desc'``; `nulls` may be ``'first'``, ``'last'`` or
+    ``'auto'``. The `nulls` argument gives the default for every field and
+    is overridden by a per-field `nulls` value.
+
+    The `short_rows` argument controls how rows that are too short to
+    contain a key field are handled: ``'fill'`` (the default, for backwards
+    compatibility) treats the missing field as an actual ``None`` value;
+    ``'raise'`` raises a :class:`petl.errors.SortError`; ``'distinct'``
+    keeps the absent field separate from explicit ``None`` values, with
+    absent fields sorting immediately beyond the null position (after
+    ``None`` when nulls are first; after everything else when nulls are
+    last).
+
+    Rows with equal sort keys keep their original input order; whole rows are
+    never compared to break ties.
+
     The `buffersize` argument should be an `int` or `None`.
 
     If the number of rows in the table is less than `buffersize`, the table
     will be sorted in memory. Otherwise, the table is sorted in chunks of
-    no more than `buffersize` rows, each chunk is written to a temporary file,
-    and then a merge sort is performed on the temporary files.
+    no more than `buffersize` rows, each chunk is written to a temporary
+    file, and then a merge sort is performed on the temporary files.
 
     If `buffersize` is `None`, the value of
     `petl.config.sort_buffersize` will be used. By default this is
@@ -102,13 +242,20 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     If `petl.config.sort_buffersize` is set to `None`, this forces
     all sorting to be done entirely in memory.
 
-    By default the results of the sort will be cached, and so a second pass over
-    the sorted table will yield rows from the cache and will not repeat the
-    sort operation. To turn off caching, set the `cache` argument to `False`.
+    By default the results of the sort will be cached, and so a second pass
+    over the sorted table will yield rows from the cache and will not repeat
+    the sort operation. To turn off caching, set the `cache` argument to
+    `False`.
+
+    The `key`/`reverse` and `sortkey` calling styles cannot be mixed:
+    passing both `key` and `sortkey`, or `reverse=True` together with
+    `sortkey`, raises an :class:`petl.errors.ArgumentError`.
 
     """
 
-    return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
+    return SortView(table, key=key, reverse=reverse, sortkey=sortkey,
+                    nulls=nulls, short_rows=short_rows,
+                    buffersize=buffersize,
                     tempdir=tempdir, cache=cache)
 
 
@@ -127,103 +274,105 @@ def _iterchunk(fn):
     debug('end of iterchunk, closed %s' % fn)
 
 
-class _Keyed(namedtuple('Keyed', ['key', 'obj'])):
-    #  Override default behavior of namedtuple comparisons, only keys need to be compared for heapmerge
-    def __eq__(self, other):
-        return self.key == other.key
+def _stabilized_merge(getkey, *iterables):
+    """Stable k-way merge of iterables already ordered by `getkey`.
 
-    def __lt__(self, other):
-        return self.key < other.key
+    Heap entries are ``(key, chunk_order, seq, row, iterator)``. The
+    ``(chunk_order, seq)`` pair is globally unique, so ties between equal
+    sort keys are resolved by original input position without ever comparing
+    whole rows.
+    """
 
-    def __le__(self, other):
-        return self.key <= other.key
-
-    def __ne__(self, other):
-        return self.key != other.key
-
-    def __gt__(self, other):
-        return self.key > other.key
-
-    def __ge__(self, other):
-        return self.key >= other.key
-
-
-def _heapqmergesorted(key=None, *iterables):
-    """Return a single iterator over the given iterables, sorted by the
-    given `key` function, assuming the input iterables are already sorted by
-    the same function. (I.e., the merge part of a general merge sort.) Uses
-    :func:`heapq.merge` for the underlying implementation."""
-
-    if key is None:
-        keyed_iterables = iterables
-        for element in heapq.merge(*keyed_iterables):
-            yield element
-    else:
-        keyed_iterables = [(_Keyed(key(obj), obj) for obj in iterable)
-                           for iterable in iterables]
-        for element in heapq.merge(*keyed_iterables):
-            yield element.obj
-
-
-def _shortlistmergesorted(key=None, reverse=False, *iterables):
-    """Return a single iterator over the given iterables, sorted by the
-    given `key` function, assuming the input iterables are already sorted by
-    the same function. (I.e., the merge part of a general merge sort.) Uses
-    :func:`min` (or :func:`max` if ``reverse=True``) for the underlying
-    implementation."""
-
-    if reverse:
-        op = max
-    else:
-        op = min
-    if key is not None:
-        opkwargs = {'key': key}
-    else:
-        opkwargs = dict()
-    # populate initial shortlist
-    # (remember some iterables might be empty)
-    iterators = list()
-    shortlist = list()
-    for iterable in iterables:
+    heap = []
+    for order, iterable in enumerate(iterables):
         it = iter(iterable)
         try:
             first = next(it)
-            iterators.append(it)
-            shortlist.append(first)
         except StopIteration:
-            pass
-    # do the mergesort
-    while iterators:
-        nxt = op(shortlist, **opkwargs)
-        yield nxt
-        nextidx = shortlist.index(nxt)
+            continue
+        heap.append((getkey(first), order, 0, first, it))
+    if not heap:
+        return
+    heapq.heapify(heap)
+    while heap:
+        key, order, seq, row, it = heapq.heappop(heap)
+        yield row
         try:
-            shortlist[nextidx] = next(iterators[nextidx])
+            nxt = next(it)
         except StopIteration:
-            del shortlist[nextidx]
-            del iterators[nextidx]
+            continue
+        heapq.heappush(heap, (getkey(nxt), order, seq + 1, nxt, it))
 
 
-def _mergesorted(key=None, reverse=False, *iterables):
-    # N.B., I've used heapq for normal merge sort and shortlist merge sort for
-    # reverse merge sort because I've assumed that heapq.merge is faster and
-    # so is preferable but it doesn't support reverse sorting so the shortlist
-    # merge sort has to be used for reverse sorting. Some casual profiling
-    # suggests there isn't much between the two in terms of speed, but might be
-    # worth profiling more carefully
+def _identitykey(row):
+    return row
 
+
+def _rowmergesorted(getkey, *iterables):
+    # N.B., a single stable merge implementation is used whether or not the
+    # sort direction is descending, because direction is encoded in the key
+    if getkey is None:
+        return _stabilized_merge(_identitykey, *iterables)
+    return _stabilized_merge(getkey, *iterables)
+
+
+def _build_keygetter(hdr, fieldspecs, reverse, nulls, short_rows):
+    """Construct the key function and resolved field specs for a header.
+
+    Returns ``(getkey, specs)`` where `specs` is a list of
+    ``(index, descending, nulls, missing)`` tuples. Returns
+    ``(None, None)`` for a legacy lexical sort (no key fields).
+    """
+
+    if fieldspecs is None:
+        # legacy calling convention: key/reverse
+        if hdr is None:
+            indices = []
+        else:
+            indices = list(range(len(hdr)))
+        specs = [(i, reverse, nulls, short_rows) for i in indices]
+        if not specs:
+            return None, None
+        return sortable_itemgetter(*specs), specs
+
+    # new calling convention
     if reverse:
-        return _shortlistmergesorted(key, True, *iterables)
-    else:
-        return _heapqmergesorted(key, *iterables)
+        raise ArgumentError(
+            "reverse must not be used together with sortkey; specify "
+            "per-field direction in sortkey instead")
+    parsed = _parse_sortkey(fieldspecs, nulls)
+    if hdr is None:
+        raise ArgumentError('a header is required to resolve sortkey fields')
+    indices = asindices(hdr, [f for f, _, _ in parsed])
+    specs = [(index, descending, field_nulls, short_rows)
+             for index, (_, descending, field_nulls)
+             in zip(indices, parsed)]
+    return sortable_itemgetter(*specs), specs
 
 
 class SortView(Table):
-    def __init__(self, source, key=None, reverse=False, buffersize=None,
+    def __init__(self, source, key=None, reverse=False, sortkey=None,
+                 nulls=_NULLS_AUTO, short_rows=_SHORT_FILL, buffersize=None,
                  tempdir=None, cache=True):
+        if key is not None and sortkey is not None:
+            raise ArgumentError(
+                "key and sortkey cannot be used together; choose one way "
+                "of specifying the sort order")
+        if sortkey is not None and reverse:
+            raise ArgumentError(
+                "reverse=True cannot be used together with sortkey; "
+                "specify per-field direction in sortkey instead")
+        if not isinstance(reverse, bool):
+            raise ArgumentError(
+                'reverse must be True or False, found %r' % (reverse,))
+        _check_nulls(nulls)
+        _check_short_rows(short_rows)
         self.source = source
         self.key = key
         self.reverse = reverse
+        self.sortkey = sortkey
+        self.nulls = nulls
+        self.short_rows = short_rows
         if buffersize is None:
             self.buffersize = config.sort_buffersize
         else:
@@ -243,15 +392,12 @@ class SortView(Table):
         self._getkey = None
 
     def __iter__(self):
-        source = self.source
-        key = self.key
-        reverse = self.reverse
         if self._cache and self._memcache is not None:
             return self._iterfrommemcache()
         elif self._cache and self._filecache is not None:
             return self._iterfromfilecache()
         else:
-            return self._iternocache(source, key, reverse)
+            return self._iternocache()
 
     def _iterfrommemcache(self):
         debug('iterate from memory cache')
@@ -267,7 +413,7 @@ class SortView(Table):
         debug('iterate from file cache: %r', filenames)
         yield tuple(self._hdrcache)
         chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+        rows = _rowmergesorted(self._getkey, *chunkiters)
         try:
             for row in rows:
                 yield tuple(row)
@@ -281,32 +427,39 @@ class SortView(Table):
             del filecache
             debug('exiting generator')
 
-    def _iternocache(self, source, key, reverse):
+    def _iternocache(self):
         debug('iterate without cache')
         self.clearcache()
-        it = iter(source)
+        it = iter(self.source)
 
         try:
             hdr = next(it)
         except StopIteration:
-            if key is None:
+            if self.key is None and self.sortkey is None:
                 return  # nothing to do on a table without headers
             hdr = []
         yield tuple(hdr)
 
-        if key is not None:
-            # convert field selection into field indices
-            indices = asindices(hdr, key)
+        if self.sortkey is not None:
+            # new calling convention: per-field direction and null placement
+            fieldspecs = self.sortkey
+            getkey, _ = _build_keygetter(
+                hdr, fieldspecs, False, self.nulls, self.short_rows)
+        elif self.key is not None:
+            # legacy calling convention: a single direction for all key
+            # fields; null position follows the global reverse via 'auto'
+            fieldspecs = [(idx, self.reverse, self.nulls)
+                          for idx in asindices(hdr, self.key)]
+            getkey, _ = _build_keygetter(
+                hdr, fieldspecs, False, self.nulls, self.short_rows)
         else:
-            indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
-
-        # TODO support native comparison
+            # lexical sort over every header field
+            getkey, _ = _build_keygetter(
+                hdr, None, self.reverse, self.nulls, self.short_rows)
 
         # initialise the first chunk
         rows = list(itertools.islice(it, 0, self.buffersize))
-        rows.sort(key=getkey, reverse=reverse)
+        rows.sort(key=getkey)
 
         # have we exhausted the source iterator?
         if self.buffersize is None or len(rows) < self.buffersize:
@@ -316,7 +469,6 @@ class SortView(Table):
                 debug('caching mem')
                 self._hdrcache = hdr
                 self._memcache = rows
-                # actually not needed to iterate from memcache
                 self._getkey = getkey
 
             for row in rows:
@@ -332,11 +484,11 @@ class SortView(Table):
                 # dump the chunk
                 with NamedTemporaryFile(dir=self.tempdir, delete=False,
                                         mode='wb') as f:
-                    # N.B., we **don't** want the file to be deleted on close,
-                    # but we **do** want the file to be deleted when self
-                    # is garbage collected, or when the program exits. When
-                    # all references to the wrapper are gone, the file should
-                    # get deleted.
+                    # N.B., we **don't** want the file to be deleted on
+                    # close, but we **do** want the file to be deleted when
+                    # self is garbage collected, or when the program exits.
+                    # When all references to the wrapper are gone, the file
+                    # should get deleted.
                     wrapper = _NamedTempFileDeleteOnGC(f.name)
                     debug('created temporary chunk file %s' % f.name)
                     for row in rows:
@@ -346,7 +498,7 @@ class SortView(Table):
 
                 # grab the next chunk
                 rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+                rows.sort(key=getkey)
 
             if self._cache:
                 debug('caching files')
@@ -355,7 +507,7 @@ class SortView(Table):
                 self._getkey = getkey
 
             chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
+            for row in _rowmergesorted(getkey, *chunkiters):
                 yield tuple(row)
 
 
@@ -435,21 +587,28 @@ def mergesort(*tables, **kwargs):
     Keyword arguments:
 
     key : string or tuple of strings, optional
-        Field name or tuple of fields to sort by (defaults to `None` lexical
+        Field name or tuple of fields to sort by (defaults to `None`, lexical
         sort)
     reverse : bool, optional
-        `True` if sort in reverse (descending) order (defaults to `False`)
+        `True` for descending order (defaults to `False`)
+    sortkey : sequence, optional
+        Per-field sort specifications, as accepted by :func:`sort`; cannot be
+        combined with `key` or `reverse=True`
+    nulls : {'first', 'last', 'auto'}, optional
+        Default null placement for the sort fields (defaults to ``'auto'``)
+    short_rows : {'fill', 'raise', 'distinct'}, optional
+        How to treat rows missing a key field (defaults to ``'fill'``)
     presorted : bool, optional
         `True` if inputs are already sorted by the given key (defaults to
         `False`)
     missing : object
-        Value to fill with when input tables have different fields (defaults to
-        `None`)
+        Value to fill with when input tables have different fields (defaults
+        to `None`)
     header : sequence of strings, optional
         Specify a fixed header for the output table
     buffersize : int, optional
-        Limit the number of rows in memory per input table when inputs are not
-        presorted
+        Limit the number of rows in memory per input table when inputs are
+        not presorted
 
     """
 
@@ -460,27 +619,47 @@ Table.mergesort = mergesort
 
 
 class MergeSortView(Table):
-    def __init__(self, tables, key=None, reverse=False, presorted=False,
+    def __init__(self, tables, key=None, reverse=False, sortkey=None,
+                 nulls=_NULLS_AUTO, short_rows=_SHORT_FILL, presorted=False,
                  missing=None, header=None, buffersize=None, tempdir=None,
                  cache=True):
+        if key is not None and sortkey is not None:
+            raise ArgumentError(
+                "key and sortkey cannot be used together; choose one way "
+                "of specifying the sort order")
+        if sortkey is not None and reverse:
+            raise ArgumentError(
+                "reverse=True cannot be used together with sortkey; "
+                "specify per-field direction in sortkey instead")
+        if not isinstance(reverse, bool):
+            raise ArgumentError(
+                'reverse must be True or False, found %r' % (reverse,))
+        _check_nulls(nulls)
+        _check_short_rows(short_rows)
         self.key = key
+        self.reverse = reverse
+        self.sortkey = sortkey
+        self.nulls = nulls
+        self.short_rows = short_rows
         if presorted:
             self.tables = tables
         else:
-            self.tables = [sort(t, key=key, reverse=reverse,
+            self.tables = [sort(t, key=key, reverse=reverse, sortkey=sortkey,
+                                nulls=nulls, short_rows=short_rows,
                                 buffersize=buffersize, tempdir=tempdir,
                                 cache=cache)
                            for t in tables]
         self.missing = missing
         self._header = header
-        self.reverse = reverse
 
     def __iter__(self):
-        return itermergesort(self.tables, self.key, self._header, self.missing,
-                             self.reverse)
+        return itermergesort(self.tables, self.key, self.reverse,
+                             self.sortkey, self.nulls, self.short_rows,
+                             self._header, self.missing)
 
 
-def itermergesort(sources, key, header, missing, reverse):
+def itermergesort(sources, key, reverse, sortkey, nulls, short_rows, header,
+                  missing):
     # first need to standardise headers of all input tables
     # borrow this from itercat - TODO remove code smells
 
@@ -493,7 +672,7 @@ def itermergesort(sources, key, header, missing, reverse):
             src_hdrs.append([])
 
     if header is None:
-        # determine output fields by gathering all fields found in the sources
+        # determine output fields by gathering all the fields in the sources
         outhdr = list()
         for hdr in src_hdrs:
             for f in list(map(text_type, hdr)):
@@ -527,23 +706,32 @@ def itermergesort(sources, key, header, missing, reverse):
     sits = [_standardisedata(it, hdr, outhdr)
             for hdr, it in zip(src_hdrs, its)]
 
-    # now determine key function
-    getkey = None
-    if key is not None:
-        # convert field selection into field indices
-        indices = asindices(outhdr, key)
-        # now use field indices to construct a _getkey function
-        # N.B., this will probably raise an exception on short rows
-        getkey = comparable_itemgetter(*indices)
+    # now determine the key function using the same comparison rules as
+    # sort(), so in-memory sorting, chunking, merging and cache re-reads all
+    # agree on ordering
+    if sortkey is not None:
+        getkey, _ = _build_keygetter(outhdr, sortkey, False, nulls,
+                                     short_rows)
+    elif key is not None:
+        fieldspecs = [(idx, reverse, nulls)
+                      for idx in asindices(outhdr, key)]
+        getkey, _ = _build_keygetter(outhdr, fieldspecs, False, nulls,
+                                     short_rows)
+    else:
+        getkey, _ = _build_keygetter(outhdr, None, reverse, nulls,
+                                     short_rows)
 
-    # OK, do the merge sort
-    for row in _shortlistmergesorted(getkey, reverse, *sits):
+    # OK, do the stable merge sort
+    for row in _rowmergesorted(getkey, *sits):
         yield row
 
 
-def issorted(table, key=None, reverse=False, strict=False):
+def issorted(table, key=None, reverse=False, sortkey=None, nulls='auto',
+             short_rows='fill', strict=False):
     """
-    Return True if the table is ordered (i.e., sorted) by the given key. E.g.::
+    Return True if the table is ordered (i.e., sorted) by the given key.
+    Supports the same `key`/`reverse` and `sortkey`/`nulls`/`short_rows`
+    arguments as :func:`sort`. E.g.::
 
         >>> import petl as etl
         >>> table1 = [['foo', 'bar', 'baz'],
@@ -561,36 +749,46 @@ def issorted(table, key=None, reverse=False, strict=False):
 
     """
 
-    # determine the operator to use when comparing rows
-    if reverse and strict:
-        op = operator.lt
-    elif reverse and not strict:
-        op = operator.le
-    elif strict:
-        op = operator.gt
-    else:
-        op = operator.ge
-
     it = iter(table)
     try:
-        flds = [text_type(f) for f in next(it)]
+        hdr = [text_type(f) for f in next(it)]
     except StopIteration:
-        flds = []
-    if key is None:
-        prev = next(it)
-        for curr in it:
-            if not op(curr, prev):
-                return False
-            prev = curr
+        return True
+
+    if key is not None and sortkey is not None:
+        raise ArgumentError(
+            "key and sortkey cannot be used together; choose one way "
+            "of specifying the sort order")
+    if sortkey is not None and reverse:
+        raise ArgumentError(
+            "reverse=True cannot be used together with sortkey; "
+            "specify per-field direction in sortkey instead")
+
+    if sortkey is not None:
+        getkey, _ = _build_keygetter(hdr, sortkey, False, nulls, short_rows)
+    elif key is not None:
+        fieldspecs = [(idx, reverse, nulls)
+                      for idx in asindices(hdr, key)]
+        getkey, _ = _build_keygetter(hdr, fieldspecs, False, nulls,
+                                     short_rows)
     else:
-        getkey = comparable_itemgetter(*asindices(flds, key))
-        prev = next(it)
-        prevkey = getkey(prev)
-        for curr in it:
-            currkey = getkey(curr)
-            if not op(currkey, prevkey):
+        getkey, _ = _build_keygetter(hdr, None, reverse, nulls, short_rows)
+
+    try:
+        prevkey = getkey(next(it))
+    except StopIteration:
+        return True
+    for curr in it:
+        currkey = getkey(curr)
+        if strict:
+            # each subsequent key must be strictly greater
+            if not prevkey < currkey:
                 return False
-            prevkey = currkey
+        else:
+            # keys must be non-decreasing
+            if currkey < prevkey:
+                return False
+        prevkey = currkey
     return True
 
 

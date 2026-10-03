@@ -6,6 +6,8 @@ from functools import partial
 
 from petl.compat import text_type, binary_type, numeric_types
 
+from petl.errors import SortError
+
 
 class Comparable(object):
     """Wrapper class to allow for flexible comparison of objects of different
@@ -127,3 +129,191 @@ def _itemgetter_with_default(*args):
     if len(args) == 1:
         return partial(_get_default, item=args[0], default=None)
     return lambda obj: tuple(_get_default(obj, item=item, default=None) for item in args)
+
+
+# ---------------------------------------------------------------------------
+# Extended sort key support: per-field direction, null placement and explicit
+# distinction between a short row (missing field) and an actual ``None`` value
+# ---------------------------------------------------------------------------
+
+
+class _Missing(object):
+    """Sentinel marking a field that is absent from a short row (as opposed
+    to a field that is present but holds the value ``None``)."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(_Missing, cls).__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'MISSING'
+
+    def __bool__(self):
+        return False
+
+    __nonzero__ = __bool__
+
+
+MISSING = _Missing()
+
+
+class FieldKey(object):
+    """Comparison proxy for a single sort field.
+
+    ``category`` is ``0`` for a missing field (short row), ``1`` for an
+    actual ``None`` value and ``2`` for any other value. The caller supplies
+    the ``null_band`` of the missing/None categories so that null placement
+    (``nulls first``/``nulls last``) is respected independently of the
+    direction used to compare ordinary values.
+    """
+
+    __slots__ = ['category', 'null_band', 'descending', 'value']
+
+    def __init__(self, category, null_band, descending, value=None):
+        self.category = category
+        self.null_band = null_band
+        self.descending = descending
+        self.value = value
+
+    def _band(self):
+        if self.category < 2:
+            return self.null_band
+        return 2  # ordinary values always sort in the value band
+
+    def __eq__(self, other):
+        if not isinstance(other, FieldKey):
+            return NotImplemented
+        if self.category != other.category:
+            return False
+        if self.category < 2:
+            # both missing or both actual None; direction/band irrelevant
+            return True
+        return self.value == other.value
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __lt__(self, other):
+        if not isinstance(other, FieldKey):
+            return NotImplemented
+        band_self = self._band()
+        band_other = other._band()
+        if band_self != band_other:
+            return band_self < band_other
+        if self.category < 2:
+            # same null band: MISSING and None do not order each other,
+            # treat as equal so original input order is preserved
+            return False
+        if self.descending:
+            return other.value < self.value
+        return self.value < other.value
+
+    def __le__(self, other):
+        return self == other or self < other
+
+    def __gt__(self, other):
+        if not isinstance(other, FieldKey):
+            return NotImplemented
+        return other < self
+
+    def __ge__(self, other):
+        return self == other or other < self
+
+    def __repr__(self):
+        return 'FieldKey(%r, %r)' % (self.category, self.value)
+
+
+class RowKey(object):
+    """Lexicographic comparison proxy over a tuple of :class:`FieldKey`."""
+
+    __slots__ = ['fields']
+
+    def __init__(self, fields):
+        self.fields = tuple(fields)
+
+    def __eq__(self, other):
+        if not isinstance(other, RowKey):
+            return NotImplemented
+        return self.fields == other.fields
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __lt__(self, other):
+        if not isinstance(other, RowKey):
+            return NotImplemented
+        return self.fields < other.fields
+
+    def __le__(self, other):
+        return self == other or self < other
+
+    def __gt__(self, other):
+        if not isinstance(other, RowKey):
+            return NotImplemented
+        return other < self
+
+    def __ge__(self, other):
+        return self == other or other < self
+
+    def __iter__(self):
+        return iter(self.fields)
+
+    def __repr__(self):
+        return 'RowKey(%r)' % (self.fields,)
+
+
+def sortable_itemgetter(*specs):
+    """Build a key function implementing per-field sort semantics.
+
+    Each ``spec`` is a ``(index, descending, nulls, missing)`` tuple where
+    ``index`` is the zero-based field index, ``descending`` is a bool,
+    ``nulls`` is one of ``'first'``/``'last'``/``'auto'`` and ``missing`` is
+    one of ``'fill'``/``'raise'``/``'distinct'`` controlling how a short row
+    (a field absent from the row) is handled.
+    """
+
+    prepared = []
+    for index, descending, nulls, missing in specs:
+        # null band for the MISSING (0) and None (1) categories
+        if nulls == 'first':
+            null_band = 0
+        elif nulls == 'last':
+            null_band = 4
+        else:  # 'auto': leading when ascending, trailing when descending
+            null_band = 4 if descending else 0
+        prepared.append((index, descending, null_band, missing))
+
+    def _get(obj):
+        fields = []
+        for index, descending, null_band, missing in prepared:
+            value = MISSING
+            try:
+                value = obj[index]
+            except (IndexError, KeyError):
+                if missing == 'raise':
+                    raise SortError(
+                        'row is missing field at index %s' % index)
+                elif missing == 'distinct':
+                    fields.append(FieldKey(0, null_band, descending))
+                    continue
+                # 'fill': treat a missing field as an actual None value
+                fields.append(FieldKey(1, null_band, descending))
+                continue
+            if value is None:
+                fields.append(FieldKey(1, null_band, descending))
+            else:
+                fields.append(
+                    FieldKey(2, null_band, descending, Comparable(value)))
+        return RowKey(fields)
+
+    return _get
+

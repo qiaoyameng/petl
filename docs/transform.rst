@@ -142,6 +142,8 @@ Transforming rows
 Sorting
 -------
 
+.. autoclass:: petl.transform.sorts.SortField
+
 .. autofunction:: petl.transform.sorts.sort
 .. autofunction:: petl.transform.sorts.mergesort
 .. autofunction:: petl.transform.sorts.issorted

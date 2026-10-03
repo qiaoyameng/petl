@@ -11,7 +11,8 @@ import pytest
 
 from petl.compat import next
 
-from petl.errors import FieldSelectionError
+from petl.errors import FieldSelectionError, ArgumentError, \
+    SortError
 from petl.test.helpers import ieq, eq_
 from petl.util import nrows
 from petl.transform.basics import cat
@@ -559,3 +560,203 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+# ---------------------------------------------------------------------------
+# per-field sort direction, null placement and short-row handling
+# ---------------------------------------------------------------------------
+
+
+def _accounting_table():
+    return (('account', 'updated_at', 'note'),
+            ('B', None, 'b-null'),
+            ('A', 3, 'a-3'),
+            ('A', 9, 'a-9'),
+            ('C', 2, 'c-2'),
+            ('A', 9, 'a-9-dup'),
+            ('A', None, 'a-null'),
+            ('B', 1, 'b-1'),
+            ('C', 2, 'c-2-dup'))
+
+
+_ACCOUNTING_EXPECT = (('account', 'updated_at', 'note'),
+                      ('A', 9, 'a-9'),
+                      ('A', 9, 'a-9-dup'),
+                      ('A', 3, 'a-3'),
+                      ('A', None, 'a-null'),
+                      ('B', 1, 'b-1'),
+                      ('B', None, 'b-null'),
+                      ('C', 2, 'c-2'),
+                      ('C', 2, 'c-2-dup'))
+
+
+def test_sort_per_field_direction_and_nulls():
+    table = _accounting_table()
+    sortkey = ['account', ('updated_at', 'desc', 'last')]
+    ieq(_ACCOUNTING_EXPECT, sort(table, sortkey=sortkey, cache=False))
+
+
+def test_sort_per_field_buffered_matches_memory():
+    # the comparison rules must give identical results in memory, across
+    # chunks, after merging and when re-read from the cache
+    table = _accounting_table()
+    sortkey = ['account', ('updated_at', 'desc', 'last')]
+    memory = list(sort(table, sortkey=sortkey, buffersize=None, cache=False))
+    for buffersize in (2, 3):
+        view = sort(table, sortkey=sortkey, buffersize=buffersize,
+                    tempdir='tmp')
+        first = list(view)
+        eq_(memory, first)
+        # second pass merges the cached chunk files
+        eq_(memory, list(view))
+        # and uncached external sort agrees too
+        eq_(memory,
+           list(sort(table, sortkey=sortkey, buffersize=buffersize,
+                     cache=False, tempdir='tmp')))
+
+
+def test_sort_equal_keys_stable_across_chunks():
+    # equal sort keys must retain the original input order; whole rows are
+    # never compared to break ties
+    table = _accounting_table()
+    sortkey = ['account', ('updated_at', 'desc', 'last')]
+    result = list(sort(table, sortkey=sortkey, buffersize=2, cache=False,
+                       tempdir='tmp'))
+    notes = [r[2] for r in result[1:]]
+    assert notes.index('a-9') < notes.index('a-9-dup')
+    assert notes.index('c-2') < notes.index('c-2-dup')
+    # identical rows also stay in input order (no whole-row comparison)
+    t = (('k', 'v'), ('a', 1), ('a', 1), ('a', 1))
+    ieq(t, sort(t, sortkey=['k'], buffersize=1, cache=False, tempdir='tmp'))
+
+
+def test_sort_nulls_first_and_last_explicit():
+    table = (('k', 'v'),
+             ('a', None), ('a', 1), ('b', None), ('b', 0))
+    # ascending value with nulls first
+    expect = (('k', 'v'),
+              ('a', None), ('b', None), ('b', 0), ('a', 1))
+    ieq(expect, sort(table, sortkey=[('v', 'asc', 'first')], cache=False))
+    ieq(expect, sort(table, sortkey=[('v', 'asc', 'first')], buffersize=2,
+                     cache=False, tempdir='tmp'))
+    # ascending value with nulls last
+    expect = (('k', 'v'),
+              ('b', 0), ('a', 1), ('a', None), ('b', None))
+    ieq(expect, sort(table, sortkey=[('v', 'asc', 'last')], cache=False))
+    ieq(expect, sort(table, sortkey=[('v', 'asc', 'last')], buffersize=2,
+                     cache=False, tempdir='tmp'))
+
+
+def test_sort_nulls_default_argument():
+    table = (('k', 'v'), ('a', None), ('b', 0), ('a', 1))
+    expect = (('k', 'v'), ('b', 0), ('a', 1), ('a', None))
+    ieq(expect, sort(table, sortkey=['v'], nulls='last', cache=False))
+
+
+def test_sort_direction_as_string():
+    table = (('v',), (3,), (1,), (2,))
+    ieq((('v',), (3,), (2,), (1,)),
+        sort(table, sortkey=[('v', 'descending')], cache=False))
+    ieq((('v',), (1,), (2,), (3,)),
+        sort(table, sortkey=[('v', 'asc')], cache=False))
+
+
+def test_sort_sortfield_object():
+    from petl.transform.sorts import SortField
+    table = (('foo', 'bar'),
+             ('C',), ('A', None), ('B', 1), ('A', 2))
+    expect = (('foo', 'bar'),
+              ('A', 2), ('B', 1), ('C',), ('A', None))
+    ieq(expect, sort(table, sortkey=[SortField('bar', True, 'last')],
+                     cache=False))
+
+
+def test_sort_short_rows_fill_default():
+    # default 'fill' keeps the historical behaviour: absent cells compare
+    # like actual None values
+    table = (('foo', 'bar'), ('C',), ('A', None), ('B', 1), ('A', 2))
+    expect = (('foo', 'bar'),
+              ('C',), ('A', None), ('B', 1), ('A', 2))
+    ieq(expect, sort(table, sortkey=['bar'], cache=False))
+    ieq(expect, sort(table, sortkey=['bar'], buffersize=2, cache=False,
+                     tempdir='tmp'))
+
+
+def test_sort_short_rows_raise():
+    table = (('foo', 'bar'), ('C',), ('A', 1))
+    view = sort(table, sortkey=['bar'], short_rows='raise', cache=False)
+    with pytest.raises(SortError):
+        list(view)
+
+
+def test_sort_short_rows_distinct():
+    # explicit None and absent field stay distinct; the absent field sorts
+    # immediately beyond the null position
+    table = (('foo', 'bar'),
+             ('A', None), ('C',), ('B', 1), ('A', 2))
+    # nulls first: None (A) precedes the absent field (C)
+    expect = (('foo', 'bar'),
+              ('A', None), ('C',), ('B', 1), ('A', 2))
+    ieq(expect, sort(table, sortkey=[('bar', 'asc', 'first')],
+                     short_rows='distinct', cache=False))
+    # nulls last: values, then None (A), then the absent field (C)
+    expect = (('foo', 'bar'),
+              ('B', 1), ('A', 2), ('A', None), ('C',))
+    ieq(expect, sort(table, sortkey=[('bar', 'asc', 'last')],
+                     short_rows='distinct', cache=False))
+    ieq(expect, sort(table, sortkey=[('bar', 'asc', 'last')],
+                     short_rows='distinct', buffersize=2, cache=False,
+                     tempdir='tmp'))
+
+
+def test_sort_mixed_arguments_rejected():
+    table = (('foo', 'bar'), ('A', 1))
+    with pytest.raises(ArgumentError):
+        sort(table, key='foo', sortkey=['foo'])
+    with pytest.raises(ArgumentError):
+        sort(table, sortkey=['foo'], reverse=True)
+    with pytest.raises(ArgumentError):
+        list(sort(table, sortkey=['foo'], nulls='middle', cache=False))
+    with pytest.raises(ArgumentError):
+        list(sort(table, sortkey=['foo'], short_rows='bogus', cache=False))
+    with pytest.raises(ArgumentError):
+        list(sort(table, sortkey=[('foo', 'sideways')], cache=False))
+    with pytest.raises(ArgumentError):
+        sort(table, key='foo', reverse='yes')
+
+
+def test_sort_legacy_key_reverse_unchanged():
+    table = _accounting_table()
+    legacy_memory = list(sort(table, 'updated_at', reverse=True))
+    legacy_buffered = list(sort(table, 'updated_at', reverse=True,
+                                buffersize=2, tempdir='tmp'))
+    eq_(legacy_memory, legacy_buffered)
+
+
+def test_mergesort_per_field():
+    t1 = (('account', 'updated_at'), ('A', 3), ('B', None))
+    t2 = (('account', 'updated_at'), ('A', 9), ('C', 2), ('B', 1))
+    sortkey = ['account', ('updated_at', 'desc', 'last')]
+    expect = sort(cat(t1, t2), sortkey=sortkey)
+    actual = mergesort(t1, t2, sortkey=sortkey, buffersize=2)
+    ieq(expect, actual)
+    ieq(expect, actual)
+    actual = mergesort(sort(t1, sortkey=sortkey),
+                       sort(t2, sortkey=sortkey),
+                       sortkey=sortkey, presorted=True)
+    ieq(expect, actual)
+
+
+def test_issorted_per_field():
+    table = list(_ACCOUNTING_EXPECT)
+    assert issorted(table, sortkey=['account', ('updated_at', 'desc', 'last')])
+    assert not issorted(_accounting_table(),
+                        sortkey=['account', ('updated_at', 'desc', 'last')])
+    # strict detects equal adjacent keys
+    dup = (('k',), (1,), (1,))
+    assert issorted(dup, key=0)
+    assert not issorted(dup, key=0, strict=True)
+    # null placement is respected
+    nulls_first = (('v',), (None,), (3,), (2,))
+    assert issorted(nulls_first, sortkey=[('v', 'desc', 'first')])
+    assert not issorted(nulls_first, sortkey=[('v', 'desc', 'last')])

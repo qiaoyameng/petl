@@ -26,3 +26,12 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class SortError(Exception):
+
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return 'sort error: %s' % self.message
