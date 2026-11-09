@@ -1,12 +1,19 @@
 from __future__ import absolute_import, print_function, division
 
 
+import gc
+import os
+import shutil
+import tempfile
+from collections import Counter
 from datetime import datetime
 
+import pytest
 
 from petl.test.helpers import ieq
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.transform.setops import complement, intersection, diff, \
-    recordcomplement, recorddiff, hashcomplement, hashintersection
+    recordcomplement, recorddiff, keydiff, hashcomplement, hashintersection
 
 
 def _test_complement_1(complement_impl):
@@ -429,3 +436,236 @@ def test_hashcomplement():
 
 def test_hashintersection():
     _test_intersection(hashintersection)
+
+
+def _keydiff_apply(a_rows, changes):
+    """Apply a keydiff change stream to a list of rows (no header)."""
+    rows = [tuple(r) for r in a_rows]
+    for change, key, before, after in changes:
+        if change == 'delete':
+            rows.remove(before)
+        elif change == 'insert':
+            rows.append(after)
+        elif change == 'update':
+            rows.remove(before)
+            rows.append(after)
+        else:
+            raise AssertionError('unexpected change type %r' % (change,))
+    return rows
+
+
+def _keydiff_sample():
+    """A few dozen rows exercising all change types."""
+    hdr = ('id', 'day', 'item', 'qty')
+    a_rows = []
+    b_rows = []
+    # unchanged records, cancelling one-to-one
+    for i in range(20):
+        a_rows.append(('k%02d' % i, 'd1', 'apple', i))
+        b_rows.append(('k%02d' % i, 'd1', 'apple', i))
+    # same record 3x in a, 2x in b -> exactly one delete
+    a_rows += [('dup', 'd1', 'pear', 1)] * 3
+    b_rows += [('dup', 'd1', 'pear', 1)] * 2
+    # updates: one leftover row on each side
+    for i in range(5):
+        a_rows.append(('u%02d' % i, 'd1', 'fig', i))
+        b_rows.append(('u%02d' % i, 'd1', 'fig', i + 100))
+    # deletes: keys only in a
+    for i in range(5):
+        a_rows.append(('del%02d' % i, 'd1', 'plum', i))
+    # inserts: keys only in b
+    for i in range(5):
+        b_rows.append(('ins%02d' % i, 'd1', 'kiwi', i))
+    # multiple leftovers on both sides -> inserts and deletes, no updates
+    for i in range(3):
+        a_rows += [('multi%02d' % i, 'd1', 'old', 1),
+                   ('multi%02d' % i, 'd1', 'old', 2)]
+        b_rows += [('multi%02d' % i, 'd1', 'new', 3)]
+    # None in the key, and None distinct from empty string
+    a_rows += [(None, 'd1', 'none', 1), ('nn', 'd1', None, 5)]
+    b_rows += [(None, 'd1', 'none', 2), ('nn', 'd1', '', 5)]
+    return hdr, a_rows, b_rows
+
+
+def test_keydiff_exact():
+    a = (('id', 'sub', 'v'),
+         (None, 'z', 1),
+         ('k1', 'a', 1),
+         ('k1', 'a', 1),
+         ('k1', 'b', 2),
+         ('k2', 'x', None),
+         ('k3', 'p', ''),
+         ('k4', 'q', 5),
+         ('k6', 'n', None),
+         ('k7', 'm', 1),
+         ('k8', 'm', 1),
+         ('k8', 'm', 2))
+    # same fields, different order
+    b = (('v', 'sub', 'id'),
+         (1, 'z', None),
+         (2, 'z', None),
+         (1, 'a', 'k1'),
+         (9, 'b', 'k1'),
+         (None, 'x', 'k2'),
+         (7, 'x', 'k2'),
+         ('', 'p', 'k3'),
+         ('', 'p', 'k3'),
+         (10, 'z', 'k5'),
+         ('', 'n', 'k6'),
+         (2, 'm', 'k7'),
+         (3, 'm', 'k7'),
+         (3, 'm', 'k8'))
+    # force the disk path with a tiny buffer
+    result = keydiff(a, b, key=('id', 'sub'), buffersize=2)
+    expectation = (
+        ('change', 'key', 'before', 'after'),
+        # None key sorts first; one pair cancels, one insert remains
+        ('insert', (None, 'z'), None, (None, 'z', 2)),
+        # 2x vs 1x -> a single delete
+        ('delete', ('k1', 'a'), ('k1', 'a', 1), None),
+        # one leftover each side -> update
+        ('update', ('k1', 'b'), ('k1', 'b', 2), ('k1', 'b', 9)),
+        # None value pair cancels, one insert remains
+        ('insert', ('k2', 'x'), None, ('k2', 'x', 7)),
+        ('insert', ('k3', 'p'), None, ('k3', 'p', '')),
+        ('delete', ('k4', 'q'), ('k4', 'q', 5), None),
+        ('insert', ('k5', 'z'), None, ('k5', 'z', 10)),
+        # None is distinct from empty string -> update
+        ('update', ('k6', 'n'), ('k6', 'n', None), ('k6', 'n', '')),
+        # 1 vs 2 leftovers -> delete + inserts, no guessed pairing
+        ('delete', ('k7', 'm'), ('k7', 'm', 1), None),
+        ('insert', ('k7', 'm'), None, ('k7', 'm', 2)),
+        ('insert', ('k7', 'm'), None, ('k7', 'm', 3)),
+        # 2 vs 1 leftovers -> deletes + insert, no guessed pairing
+        ('delete', ('k8', 'm'), ('k8', 'm', 1), None),
+        ('delete', ('k8', 'm'), ('k8', 'm', 2), None),
+        ('insert', ('k8', 'm'), None, ('k8', 'm', 3)),
+    )
+    ieq(expectation, result)
+
+
+def test_keydiff_apply_equation_disk():
+    # applying the change stream to `a` must yield exactly `b`, comparing
+    # by row multiplicity; this must hold under shuffled inputs, swapped
+    # column order and tiny buffers forcing the external sort path
+    import random
+    hdr, a_rows, b_rows = _keydiff_sample()
+    tempdir = tempfile.mkdtemp()
+    try:
+        for shuffle in (False, True):
+            for swap_cols in (False, True):
+                for buffersize in (2, 5, None):
+                    aa = list(a_rows)
+                    bb = list(b_rows)
+                    if shuffle:
+                        random.Random(1234).shuffle(aa)
+                        random.Random(5678).shuffle(bb)
+                    b_hdr = hdr
+                    if swap_cols:
+                        perm = (3, 2, 1, 0)
+                        b_hdr = tuple(hdr[i] for i in perm)
+                        bb = [tuple(r[i] for i in perm) for r in bb]
+                    ta = [hdr] + aa
+                    tb = [b_hdr] + bb
+                    result = keydiff(ta, tb, key=('id', 'day'),
+                                     buffersize=buffersize,
+                                     tempdir=tempdir)
+                    changes = list(result)
+                    assert changes[0] == ('change', 'key', 'before', 'after')
+                    assert len(changes) > 1
+                    applied = _keydiff_apply(aa, changes[1:])
+                    # applied rows are in the canonical (a's) field order
+                    assert Counter(applied) == Counter(map(tuple, b_rows)), \
+                        (shuffle, swap_cols, buffersize)
+                    # this pass is complete, temp files must be released
+                    gc.collect()
+                    assert os.listdir(tempdir) == [], \
+                        (shuffle, swap_cols, buffersize)
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
+
+
+def test_keydiff_one_pass_inputs():
+    # inputs may be iterators that can only be traversed once
+    hdr, a_rows, b_rows = _keydiff_sample()
+    result = keydiff(iter([hdr] + a_rows), iter([hdr] + b_rows),
+                     key=('id', 'day'), buffersize=4)
+    changes = list(result)
+    applied = _keydiff_apply(a_rows, changes[1:])
+    assert Counter(applied) == Counter(map(tuple, b_rows))
+
+
+def test_keydiff_empty():
+    a = (('id', 'v'),)
+    b = (('v', 'id'),)
+    result = keydiff(a, b, key='id')
+    ieq((('change', 'key', 'before', 'after'),), result)
+
+
+def test_keydiff_errors():
+    a = (('id', 'v'), (1, 'x'))
+    b = (('id', 'v'), (1, 'x'))
+    # empty key
+    with pytest.raises(ArgumentError):
+        keydiff(a, b, key=())
+    # duplicate header
+    with pytest.raises(ArgumentError):
+        list(keydiff((('id', 'id'), (1, 2)), b, key='id'))
+    with pytest.raises(ArgumentError):
+        list(keydiff(a, (('id', 'v', 'v'), (1, 'x', 'y')), key='id'))
+    # missing key field
+    with pytest.raises(FieldSelectionError):
+        list(keydiff(a, b, key='nope'))
+    with pytest.raises(FieldSelectionError):
+        list(keydiff(a, b, key=('id', 'nope')))
+    # non-key field sets differ
+    with pytest.raises(ArgumentError):
+        list(keydiff(a, (('id', 'w'), (1, 'x')), key='id'))
+    # unsupported value types
+    with pytest.raises(TypeError):
+        list(keydiff((('id', 'v'), (1, 1.5)), b, key='id'))
+    with pytest.raises(TypeError):
+        list(keydiff((('id', 'v'), (1, True)), b, key='id'))
+    with pytest.raises(TypeError):
+        list(keydiff(a, (('id', 'v'), (1, 2.5)), key='id'))
+
+
+def test_keydiff_cleanup_on_close():
+    # closing the change stream early must release this pass's temp files
+    hdr, a_rows, b_rows = _keydiff_sample()
+    tempdir = tempfile.mkdtemp()
+    try:
+        result = keydiff([hdr] + a_rows, [hdr] + b_rows, key=('id', 'day'),
+                         buffersize=2, tempdir=tempdir)
+        it = iter(result)
+        next(it)
+        next(it)
+        assert os.listdir(tempdir) != []  # disk path was exercised
+        it.close()
+        del it
+        gc.collect()
+        assert os.listdir(tempdir) == []
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
+
+
+def test_keydiff_cleanup_on_source_error():
+    # a failing source must not leave this pass's temp files behind
+    hdr, a_rows, b_rows = _keydiff_sample()
+    tempdir = tempfile.mkdtemp()
+
+    def boom():
+        yield hdr
+        for row in a_rows[:7]:
+            yield row
+        raise RuntimeError('source failed')
+
+    try:
+        result = keydiff(boom(), [hdr] + b_rows, key=('id', 'day'),
+                         buffersize=2, tempdir=tempdir)
+        with pytest.raises(RuntimeError):
+            list(result)
+        gc.collect()
+        assert os.listdir(tempdir) == []
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
