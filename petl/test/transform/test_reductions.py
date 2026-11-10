@@ -8,10 +8,11 @@ import pytest
 
 from collections import OrderedDict
 from petl.test.helpers import ieq
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.util import strjoin
+from petl.util.base import wrap
 from petl.transform.reductions import rowreduce, aggregate, \
-    mergeduplicates, merge, Conflict, fold
+    mergeduplicates, merge, Conflict, fold, groupingsets
 
 
 def test_rowreduce():
@@ -728,3 +729,179 @@ def test_fold():
     expect = (('key', 'value'), (1, 8), (2, 12))
     ieq(expect, t2)
     ieq(expect, t2)
+
+
+def _groupingsets_table():
+    # None, empty string and numeric zero all present
+    return (('region', 'channel', 'amount'),
+            ('east', 'web', 10),
+            ('east', '', 0),
+            ('east', 'web', None),
+            (None, 'web', 5),
+            ('west', None, 7),
+            ('west', '', 0))
+
+
+def _groupingsets_aggregation():
+    aggregation = OrderedDict()
+    aggregation['n'] = 'count'
+    aggregation['total'] = 'amount', 'sum'
+    aggregation['amin'] = 'amount', 'min'
+    aggregation['amax'] = 'amount', 'max'
+    return aggregation
+
+
+def test_groupingsets():
+    table = _groupingsets_table()
+    result = groupingsets(table, dims=('region', 'channel'),
+                          sets=[('region', 'channel'), ('region',), ()],
+                          aggregation=_groupingsets_aggregation())
+    expect = (('region', 'channel', 'n', 'total', 'amin', 'amax',
+               'grouping_id'),
+              (None, 'web', 1, 5, 5, 5, 0),
+              ('east', '', 1, 0, 0, 0, 0),
+              ('east', 'web', 2, 10, 10, 10, 0),
+              ('west', None, 1, 7, 7, 7, 0),
+              ('west', '', 1, 0, 0, 0, 0),
+              (None, None, 1, 5, 5, 5, 1),
+              ('east', None, 3, 10, 0, 10, 1),
+              ('west', None, 2, 7, 0, 7, 1),
+              (None, None, 6, 22, 0, 10, 3))
+    ieq(expect, result)
+    # result is re-iterable
+    ieq(expect, result)
+
+
+def test_groupingsets_vs_independent_aggregate():
+    # cross-check each grouping set against an independent aggregation
+    table = _groupingsets_table()
+    sets = [('region', 'channel'), ('region',), ()]
+    result = list(groupingsets(table, dims=('region', 'channel'), sets=sets,
+                               aggregation=_groupingsets_aggregation()))
+    hdr, rows = result[0], result[1:]
+    gididx = hdr.index('grouping_id')
+    nidx = hdr.index('n')
+    for gs, gid in ((('region', 'channel'), 0), (('region',), 1), ((), 3)):
+        block = [r for r in rows if r[gididx] == gid]
+        if not gs:
+            assert len(block) == 1
+            assert block[0][nidx] == len(table) - 1
+        else:
+            # independent count per group via petl.aggregate
+            indep = list(aggregate(table, list(gs), len))
+            assert [r[nidx] for r in block] == [r[len(gs)] for r in indep[1:]]
+            # key values appear in the dimension columns
+            for r, ik in zip(block, indep[1:]):
+                keyvals = ik[:len(gs)]
+                for d, v in zip(gs, keyvals):
+                    assert r[hdr.index(d)] == v
+
+
+def test_groupingsets_duplicate_sets():
+    table = _groupingsets_table()
+    aggregation = _groupingsets_aggregation()
+    result = groupingsets(table, dims=('region', 'channel'),
+                          sets=[('region', 'channel'), ('channel', 'region'),
+                                ('region',), ('region',), (), ()],
+                          aggregation=aggregation)
+    reference = groupingsets(table, dims=('region', 'channel'),
+                             sets=[('region', 'channel'), ('region',), ()],
+                             aggregation=aggregation)
+    ieq(reference, result)
+
+
+def test_groupingsets_empty_source():
+    table = (('region', 'channel', 'amount'),)
+    result = groupingsets(table, dims=('region', 'channel'),
+                          sets=[('region',), ()],
+                          aggregation=_groupingsets_aggregation())
+    # the empty grouping set still yields a grand total row with count zero
+    expect = (('region', 'channel', 'n', 'total', 'amin', 'amax',
+               'grouping_id'),
+              (None, None, 0, None, None, None, 3))
+    ieq(expect, result)
+
+
+def test_groupingsets_single_set():
+    table = _groupingsets_table()
+    aggregation = _groupingsets_aggregation()
+    # grand total only
+    result = groupingsets(table, dims=('region', 'channel'), sets=[()],
+                          aggregation=aggregation)
+    expect = (('region', 'channel', 'n', 'total', 'amin', 'amax',
+               'grouping_id'),
+              (None, None, 6, 22, 0, 10, 3))
+    ieq(expect, result)
+    # single non-empty set, matches the corresponding block of the full run
+    result = groupingsets(table, dims=('region', 'channel'),
+                          sets=[('region',)], aggregation=aggregation)
+    expect = (('region', 'channel', 'n', 'total', 'amin', 'amax',
+               'grouping_id'),
+              (None, None, 1, 5, 5, 5, 1),
+              ('east', None, 3, 10, 0, 10, 1),
+              ('west', None, 2, 7, 0, 7, 1))
+    ieq(expect, result)
+
+
+def test_groupingsets_buffersize():
+    table = _groupingsets_table()
+    aggregation = _groupingsets_aggregation()
+    sets = [('region', 'channel'), ('region',), ()]
+    reference = list(groupingsets(table, dims=('region', 'channel'),
+                                  sets=sets, aggregation=aggregation))
+    # a tiny sort buffer forces chunked sorting via temporary files, the
+    # values and grouping ids must not change
+    actual = list(groupingsets(table, dims=('region', 'channel'), sets=sets,
+                               aggregation=aggregation, buffersize=2))
+    assert reference == actual
+
+
+def test_groupingsets_source_read_once():
+    # a generator can only be consumed once, so correct output proves the
+    # source is only read once even with multiple grouping sets
+    def gen():
+        for row in _groupingsets_table():
+            yield row
+    result = groupingsets(gen(), dims=('region', 'channel'),
+                          sets=[('region', 'channel'), ('region',), ()],
+                          aggregation=_groupingsets_aggregation())
+    expect = groupingsets(_groupingsets_table(), dims=('region', 'channel'),
+                          sets=[('region', 'channel'), ('region',), ()],
+                          aggregation=_groupingsets_aggregation())
+    ieq(expect, result)
+
+
+def test_groupingsets_fluent():
+    table = wrap(_groupingsets_table())
+    result = table.groupingsets(dims=('region', 'channel'),
+                                sets=[('region', 'channel'), ('region',), ()],
+                                aggregation=_groupingsets_aggregation())
+    expect = groupingsets(_groupingsets_table(), dims=('region', 'channel'),
+                          sets=[('region', 'channel'), ('region',), ()],
+                          aggregation=_groupingsets_aggregation())
+    ieq(expect, result)
+
+
+def test_groupingsets_invalid():
+    table = _groupingsets_table()
+    aggregation = _groupingsets_aggregation()
+    # grouping set member that is not a dimension
+    with pytest.raises(ArgumentError):
+        groupingsets(table, dims=('region', 'channel'),
+                     sets=[('region', 'amount')], aggregation=aggregation)
+    # unknown aggregation operation
+    with pytest.raises(ArgumentError):
+        groupingsets(table, dims=('region', 'channel'), sets=[('region',)],
+                     aggregation={'x': ('amount', 'mean')})
+    with pytest.raises(ArgumentError):
+        groupingsets(table, dims=('region', 'channel'), sets=[('region',)],
+                     aggregation={'x': 'sum'})
+    # dimension not in the source table
+    with pytest.raises(FieldSelectionError):
+        list(groupingsets(table, dims=('region', 'nope'),
+                          sets=[('region',)], aggregation=aggregation))
+    # aggregation field not in the source table
+    with pytest.raises(FieldSelectionError):
+        list(groupingsets(table, dims=('region', 'channel'),
+                          sets=[('region',)],
+                          aggregation={'x': ('nope', 'sum')}))

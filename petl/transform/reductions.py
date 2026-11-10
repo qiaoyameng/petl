@@ -4,14 +4,18 @@ from __future__ import absolute_import, print_function, division
 import itertools
 import operator
 from collections import OrderedDict
+from tempfile import NamedTemporaryFile
 from petl.compat import next, string_types, reduce, text_type
+from petl.compat import pickle
 
 
 from petl.errors import ArgumentError, FieldSelectionError
+from petl.comparison import Comparable
 from petl.util.base import Table, iterpeek, rowgroupby, asindices
 from petl.util.base import values, records
 from petl.util.counting import nrows
-from petl.transform.sorts import sort, mergesort
+from petl.transform.sorts import sort, mergesort, _iterchunk, \
+    _NamedTempFileDeleteOnGC
 from petl.transform.basics import cut
 from petl.transform.dedup import distinct
 
@@ -402,6 +406,285 @@ def itermultiaggregate(source, key, aggregation):
                 aggval = aggfun(vals)
                 outrow.append(aggval)
         yield tuple(outrow)
+
+
+_groupingsets_ops = ('count', 'sum', 'min', 'max')
+
+
+def groupingsets(table, dims, sets, aggregation, buffersize=None,
+                 tempdir=None, cache=True):
+    """Aggregate over multiple grouping sets in a single pass over the
+    source data, similar to SQL ``GROUP BY GROUPING SETS``. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['region', 'channel', 'sales'],
+        ...           ['east', 'web', 10],
+        ...           ['east', 'store', 5],
+        ...           ['west', 'web', 7],
+        ...           ['west', None, 3],
+        ...           [None, 'web', 2]]
+        >>> agg = {'n': 'count', 'total': ('sales', 'sum')}
+        >>> table2 = etl.groupingsets(table1, dims=('region', 'channel'),
+        ...                           sets=[('region', 'channel'),
+        ...                                 ('region',), ()],
+        ...                           aggregation=agg)
+        >>> etl.lookall(table2)
+        +--------+---------+---+-------+-------------+
+        | region | channel | n | total | grouping_id |
+        +========+=========+===+=======+=============+
+        | None   | 'web'   | 1 |     2 |           0 |
+        +--------+---------+---+-------+-------------+
+        | 'east' | 'store' | 1 |     5 |           0 |
+        +--------+---------+---+-------+-------------+
+        | 'east' | 'web'   | 1 |    10 |           0 |
+        +--------+---------+---+-------+-------------+
+        | 'west' | None    | 1 |     3 |           0 |
+        +--------+---------+---+-------+-------------+
+        | 'west' | 'web'   | 1 |     7 |           0 |
+        +--------+---------+---+-------+-------------+
+        | None   | None    | 1 |     2 |           1 |
+        +--------+---------+---+-------+-------------+
+        | 'east' | None    | 2 |    15 |           1 |
+        +--------+---------+---+-------+-------------+
+        | 'west' | None    | 2 |    10 |           1 |
+        +--------+---------+---+-------+-------------+
+        | None   | None    | 5 |    27 |           3 |
+        +--------+---------+---+-------+-------------+
+
+    The `dims` argument gives the full set of dimension fields, and `sets`
+    gives the grouping sets to compute, each a selection of dimension
+    fields (use an empty tuple for the grand total). Every output row
+    carries all dimension columns; dimensions not participating in the
+    current grouping set are output as `None`, and the final
+    `grouping_id` column has the bit corresponding to each aggregated-away
+    dimension set to 1 (the first dimension is the most significant bit).
+    Dimensions whose value is `None` in the source data keep a bit of 0,
+    so genuine `None` values can be told apart from aggregated-away
+    dimensions.
+
+    The `aggregation` argument is a dictionary mapping output field names
+    to aggregation specifications. Use the string ``'count'`` to count
+    rows, or a ``(field, op)`` tuple where `op` is one of ``'count'``
+    (count non-`None` values), ``'sum'``, ``'min'`` or ``'max'``. The
+    ``'sum'``, ``'min'`` and ``'max'`` operations ignore `None` values,
+    and evaluate to `None` if all values in the group are `None`.
+
+    Duplicate grouping sets are only computed once. Grouping sets are
+    emitted in the order they are first declared, and groups within each
+    set are sorted by the set's key (`None` sorts first). The empty
+    grouping set always yields exactly one row, even on empty input.
+
+    The source table is read at most once. If more than one grouping set
+    is requested, rows are spooled to a temporary file (under `tempdir` if
+    given) so that each set can be processed without re-reading the
+    source; the `buffersize`, `tempdir` and `cache` arguments are passed
+    on to the per-set sort, see :func:`petl.transform.sorts.sort`.
+
+    """
+
+    return GroupingSetsView(table, dims, sets, aggregation,
+                            buffersize=buffersize, tempdir=tempdir,
+                            cache=cache)
+
+
+Table.groupingsets = groupingsets
+
+
+class GroupingSetsView(Table):
+
+    def __init__(self, table, dims, sets, aggregation, buffersize=None,
+                 tempdir=None, cache=True):
+        self.table = table
+        if isinstance(dims, string_types):
+            dims = (dims,)
+        self.dims = tuple(dims)
+        self.sets = _normalise_grouping_sets(sets, self.dims)
+        self.aggregation = _normalise_grouping_aggregations(aggregation)
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.cache = cache
+
+    def __iter__(self):
+        return itergroupingsets(self.table, self.dims, self.sets,
+                                self.aggregation, self.buffersize,
+                                self.tempdir, self.cache)
+
+
+def _normalise_grouping_sets(sets, dims):
+    if isinstance(sets, string_types):
+        sets = (sets,)
+    normalised = []
+    seen = set()
+    for s in sets:
+        if isinstance(s, string_types):
+            s = (s,)
+        s = tuple(s)
+        unknown = [d for d in s if d not in dims]
+        if unknown:
+            raise ArgumentError('grouping set members must be dimensions, '
+                                'found %r' % (unknown,))
+        # canonicalise to dimension order so equivalent sets declared with
+        # different member order are only computed once
+        canonical = tuple(d for d in dims if d in s)
+        if canonical not in seen:
+            seen.add(canonical)
+            normalised.append(canonical)
+    return tuple(normalised)
+
+
+def _normalise_grouping_aggregations(aggregation):
+    normalised = OrderedDict()
+    if aggregation is None:
+        return normalised
+    for outfld in aggregation:
+        spec = aggregation[outfld]
+        if isinstance(spec, string_types):
+            if spec != 'count':
+                raise ArgumentError('invalid aggregation operation: %r'
+                                    % (spec,))
+            normalised[outfld] = None, 'count'
+        elif isinstance(spec, (list, tuple)) and len(spec) == 2:
+            srcfld, op = spec
+            if op not in _groupingsets_ops:
+                raise ArgumentError('invalid aggregation operation: %r'
+                                    % (op,))
+            normalised[outfld] = srcfld, op
+        else:
+            raise ArgumentError('invalid aggregation: %r, %r'
+                                % (outfld, spec))
+    return normalised
+
+
+class _GroupingSetAccumulator(object):
+
+    __slots__ = ['idx', 'op', 'count', 'total', 'has', 'extreme']
+
+    def __init__(self, idx, op):
+        self.idx = idx
+        self.op = op
+        self.count = 0
+        self.total = 0
+        self.has = False
+        self.extreme = None
+
+    def update(self, row):
+        idx = self.idx
+        if idx is None:
+            # count rows
+            self.count += 1
+            return
+        v = row[idx]
+        if v is None:
+            return
+        if self.op == 'count':
+            self.count += 1
+        elif self.op == 'sum':
+            self.total += v
+            self.has = True
+        elif not self.has:
+            self.extreme = v
+            self.has = True
+        elif self.op == 'min':
+            if Comparable(v) < Comparable(self.extreme):
+                self.extreme = v
+        else:  # max
+            if Comparable(self.extreme) < Comparable(v):
+                self.extreme = v
+
+    def result(self):
+        if self.op == 'count':
+            return self.count
+        if not self.has:
+            return None
+        if self.op == 'sum':
+            return self.total
+        return self.extreme
+
+
+class _SpooledTable(Table):
+    """Read the source table once, spooling rows to a temporary file so
+    the data can be iterated more than once."""
+
+    def __init__(self, source, tempdir=None):
+        self.source = source
+        self.tempdir = tempdir
+        self._spoolfile = None
+
+    def __iter__(self):
+        if self._spoolfile is None:
+            with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                    mode='wb') as f:
+                # N.B., the file is deleted when the wrapper is garbage
+                # collected, see also petl.transform.sorts
+                self._spoolfile = _NamedTempFileDeleteOnGC(f.name)
+                for row in self.source:
+                    pickle.dump(tuple(row), f, protocol=-1)
+                f.flush()
+        return _iterchunk(self._spoolfile.name)
+
+
+def itergroupingsets(table, dims, sets, aggregation, buffersize, tempdir,
+                     cache):
+    if len(sets) > 1:
+        # spool the source to a temporary file so it is only read once
+        source = _SpooledTable(table, tempdir=tempdir)
+        # the spool can be iterated repeatedly, just read the header
+        hdr = tuple(next(iter(source)))
+    else:
+        # single grouping set, stream the source in one pass
+        hdr, source = iterpeek(table)
+        hdr = tuple(hdr)
+
+    # validate dimensions and resolve aggregation field indices
+    asindices(hdr, dims)
+    aggout = list(aggregation.keys())
+    aggspecs = []
+    for outfld in aggout:
+        srcfld, op = aggregation[outfld]
+        if srcfld is None:
+            idx = None
+        else:
+            idx = asindices(hdr, srcfld)[0]
+        aggspecs.append((idx, op))
+
+    ndims = len(dims)
+    yield tuple(dims) + tuple(aggout) + ('grouping_id',)
+
+    for gs in sets:
+        # bit for a dimension is 1 if the dimension is aggregated away
+        grouping_id = 0
+        for i, d in enumerate(dims):
+            if d not in gs:
+                grouping_id |= 1 << (ndims - 1 - i)
+        if not gs:
+            # grand total, no sorting needed, always exactly one row
+            accs = [_GroupingSetAccumulator(idx, op)
+                    for idx, op in aggspecs]
+            it = iter(source)
+            next(it)  # skip header
+            for row in it:
+                for acc in accs:
+                    acc.update(row)
+            outrow = [None] * ndims
+            outrow += [acc.result() for acc in accs]
+            outrow.append(grouping_id)
+            yield tuple(outrow)
+        else:
+            sortedview = sort(source, key=list(gs), buffersize=buffersize,
+                              tempdir=tempdir, cache=cache)
+            for k, rows in rowgroupby(sortedview, list(gs)):
+                if len(gs) == 1:
+                    k = (k,)
+                accs = [_GroupingSetAccumulator(idx, op)
+                        for idx, op in aggspecs]
+                for row in rows:
+                    for acc in accs:
+                        acc.update(row)
+                keyvals = dict(zip(gs, k))
+                outrow = [keyvals[d] if d in gs else None for d in dims]
+                outrow += [acc.result() for acc in accs]
+                outrow.append(grouping_id)
+                yield tuple(outrow)
 
 
 def groupcountdistinctvalues(table, key, value):

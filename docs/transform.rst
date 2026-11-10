@@ -204,6 +204,7 @@ Reducing rows (aggregation)
 ---------------------------
 
 .. autofunction:: petl.transform.reductions.aggregate
+.. autofunction:: petl.transform.reductions.groupingsets
 .. autofunction:: petl.transform.reductions.rowreduce
 .. autofunction:: petl.transform.reductions.mergeduplicates
 .. autofunction:: petl.transform.reductions.merge
