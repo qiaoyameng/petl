@@ -148,6 +148,15 @@ Sorting
 .. autofunction:: petl.transform.sorts.issorted
 
 
+.. module:: petl.transform.rolling
+.. _transform_rolling:
+
+Rolling windows
+---------------
+
+.. autofunction:: petl.transform.rolling.addrollingquantile
+
+
 .. module:: petl.transform.joins
 .. _transform_joins:
 
