@@ -148,6 +148,15 @@ Sorting
 .. autofunction:: petl.transform.sorts.issorted
 
 
+.. module:: petl.transform.scd
+.. _transform_scd:
+
+Slowly changing dimensions
+---------------------------
+
+.. autofunction:: petl.transform.scd.scd2
+
+
 .. module:: petl.transform.joins
 .. _transform_joins:
 
