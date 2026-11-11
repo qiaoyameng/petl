@@ -67,6 +67,12 @@ Standardizing values
 .. autofunction:: petl.transform.standardize.standardize
 
 
+Generalizing quasi-identifiers (k-anonymity)
+--------------------------------------------
+
+.. autofunction:: petl.transform.generalize.generalize
+
+
 .. module:: petl.transform.selects
 .. _transform_selects:
 

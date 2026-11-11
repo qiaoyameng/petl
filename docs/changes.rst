@@ -4,6 +4,14 @@ Changes
 Version 1.7.32
 --------------
 
+* Add ``generalize()`` to generalize quasi-identifier columns through
+  finite user-supplied hierarchies so every non-empty equivalence class
+  reaches a minimum size ``k``, selecting the minimum-loss level
+  combination. The source is read once and staged locally, spilling to a
+  temporary pickle file past a row cap; candidate counts and in-memory rows
+  are bounded and infeasible or over-budget searches raise
+  ``GeneralizationError`` rather than returning a partial answer.
+
 * Exclude negatively selected fields from the inferred keys or variables
   in ``melt()``.
   By :user:`IlyaKhalafi`, :issue:`786`.

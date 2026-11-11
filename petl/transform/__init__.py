@@ -57,3 +57,5 @@ from petl.transform.intervals import intervaljoin, intervalleftjoin, \
 from petl.transform.validation import validate
 
 from petl.transform.standardize import standardize
+
+from petl.transform.generalize import generalize, GeneralizeView
