@@ -16,6 +16,12 @@ display_limit = 5
 display_index_header = False
 display_vrepr = text_type
 sort_buffersize = 100000
+change_buffersize = 10000
+"""
+Default maximum number of staged, uncommitted change events kept in memory by
+:func:`petl.transform.changeevents.foldchanges`. Once a transaction grows past
+this size its staging area is moved to a temporary SQLite database.
+"""
 failonerror=False # False, True, 'inline'
 """
 Controls what happens when unhandled exceptions are raised in a

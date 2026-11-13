@@ -240,6 +240,15 @@ Filling missing values
 .. autofunction:: petl.transform.fills.fillleft
 
 
+.. module:: petl.transform.changeevents
+.. _transform_changeevents:
+
+Change events
+-------------
+
+.. autofunction:: petl.transform.changeevents.foldchanges
+
+
 .. module:: petl.transform.validation
 .. _transform_validation:
 
