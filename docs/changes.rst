@@ -1,6 +1,19 @@
 Changes
 =======
 
+Version 1.7.33
+--------------
+
+* Add ``foldchanges()``, a view that folds an ordered stream of
+  ``begin``/``insert``/``update``/``delete``/``commit``/``rollback`` events
+  into the net change of each committed transaction. The caller supplies a
+  compound primary key and a read-only initial-state lookup. Event images are
+  validated against the transaction-visible state, key moves check target
+  occupancy, insert/delete pairs cancel, and rollbacks leave later
+  transactions untouched. Duplicate or misplaced transaction boundaries raise
+  an error carrying the event position. Transactions can stage more keys than
+  the in-memory budget by spilling to a temporary SQLite database.
+
 Version 1.7.32
 --------------
 

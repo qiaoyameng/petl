@@ -249,6 +249,17 @@ Validation
 .. autofunction:: petl.transform.validation.validate
 
 
+.. module:: petl.transform.changefold
+.. _transform_changefold:
+
+Folding ordered change events
+-----------------------------
+
+.. autofunction:: petl.transform.changefold.foldchanges
+.. autoclass:: petl.transform.changefold.FoldedChangesView
+.. autoclass:: petl.transform.changefold.NetChange
+
+
 .. module:: petl.transform.intervals
 .. _transform_intervals:
 

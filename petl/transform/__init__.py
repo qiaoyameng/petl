@@ -56,4 +56,7 @@ from petl.transform.intervals import intervaljoin, intervalleftjoin, \
 
 from petl.transform.validation import validate
 
+from petl.transform.changefold import foldchanges, FoldedChangesView, \
+    NetChange
+
 from petl.transform.standardize import standardize
